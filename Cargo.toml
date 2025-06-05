@@ -1,0 +1,61 @@
+[package]
+name = "undeadlock"
+version = "0.1.0"
+edition = "2021"
+authors = ["EDAMAME Technologies"]
+description = "Custom synchronization primitives with deadlock detection"
+license = "Apache-2.0"
+repository = "https://github.com/edamametechnologies/undeadlock"
+keywords = ["deadlock", "mutex", "rwlock", "sync", "concurrency"]
+categories = ["concurrency", "data-structures"]
+
+[lints.rust]
+async_fn_in_trait = "allow"
+
+[features]
+default = []
+tokio-console = []
+examples = ["clap", "tracing-subscriber"]
+
+[dependencies]
+# Core dependencies
+lazy_static = "1.5.0"
+once_cell = "1.19.0"
+
+# Async
+parking_lot = "0.12.3"
+tokio = { version = "1.39.2", features = ["sync", "macros", "time"] }
+dashmap = "6.0.1"
+
+# Logging
+tracing = "0.1.40"
+
+# Misc
+chrono = { version = "0.4.38" }
+anyhow = { version = "1.0.86" }
+
+# Example dependencies (optional)
+clap = { version = "4.0", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+# Development dependencies
+[dev-dependencies]
+tokio = { version = "1.39.2", features = ["full", "test-util"] }
+criterion = "0.5"
+rayon = "1.7"
+
+[[example]]
+name = "basic_rwlock"
+required-features = ["examples"]
+
+[[example]]
+name = "dashmap_usage"
+required-features = ["examples"]
+
+[[example]]
+name = "mutex_ordering"
+required-features = ["examples"]
+
+[lib]
+name = "undeadlock"
+path = "src/lib.rs" 
