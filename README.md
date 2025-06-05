@@ -1,149 +1,116 @@
 # Undeadlock
 
-Custom synchronization primitives for Rust with built-in deadlock detection and prevention.
+Light-weight diagnostic wrappers around `tokio::sync::RwLock` and `dashmap::DashMap` that help you discover lock contention and potential dead-locks while developing.
 
-## Overview
+In **debug** builds the wrappers gather rich runtime information (back-traces, timestamps, thread-ids, locked keys, …) and emit `tracing` warnings or errors whenever:
 
-Undeadlock provides drop-in replacements for standard Rust synchronization primitives that automatically detect and prevent deadlocks during development. In release builds, they compile down to efficient wrappers with minimal overhead.
+* acquiring a read lock takes longer than **10 s**;
+* acquiring a write lock takes longer than **15 s**;
+* a `CustomDashMap` key is still held after **10 s** by another writer;
+* an instrumented map/lock operation itself runs for more than **1 s**.
 
-## Features
+The code never panics or aborts – it merely logs – so program semantics are unchanged.  You get actionable diagnostics without risking new failures.
 
-- **Deadlock Detection**: Automatically detects potential deadlocks in debug builds
-- **Lock Ordering**: Enforces consistent lock ordering to prevent deadlocks
-- **Debug Visibility**: Enhanced debugging output to trace lock acquisition
-- **Minimal Overhead**: Near-zero overhead in release builds
-- **Drop-in Replacement**: Compatible with standard library APIs
-
-## Primitives
-
-### CustomRwLock
-A RwLock implementation with read/write deadlock detection.
+In **release** builds all of the additional bookkeeping is compiled out and the types collapse to the plain primitives:
 
 ```rust
-use undeadlock::CustomRwLock;
+// release mode
+pub type CustomRwLock<T> = tokio::sync::RwLock<T>;
 
-let lock = CustomRwLock::new(vec![1, 2, 3]);
+pub struct CustomDashMap<K, V>(dashmap::DashMap<K, V>);
+```
 
-// Multiple readers
-{
-    let r1 = lock.read();
-    let r2 = lock.read();
-    println!("Values: {:?} and {:?}", *r1, *r2);
-}
+The overhead is therefore virtually zero.
 
-// Exclusive writer
-{
-    let mut w = lock.write();
-    w.push(4);
+---
+
+## Getting started
+
+Add the crate and (optionally) enable the `tokio-console` feature to propagate caller-location information into console spans:
+
+```toml
+[dependencies]
+undeadlock = { path = "../undeadlock", features = ["tokio-console"] }
+```
+
+Replace your existing locks:
+
+```rust
+use tokio::sync::RwLock;        // ❌
+use dashmap::DashMap;           // ❌
+
+use undeadlock::{               // ✅
+    CustomRwLock as RwLock,
+    CustomDashMap as DashMap,
+};
+```
+
+Everything else keeps compiling unchanged.
+
+---
+
+## Quick example
+
+```rust
+use undeadlock::{CustomDashMap, CustomRwLock};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    // emit logs to stdout
+    tracing_subscriber::fmt::init();
+
+    // keyed concurrent structure
+    let users = Arc::new(CustomDashMap::new("users"));
+    users.insert("alice", 0);
+
+    // shared counter
+    let counter = Arc::new(CustomRwLock::new(0u64));
+
+    // … spawn some tasks that stress the locks …
 }
 ```
 
-### CustomDashMap
-A concurrent HashMap with deadlock-aware locking.
-
-```rust
-use undeadlock::CustomDashMap;
-
-let map = CustomDashMap::new();
-
-// Concurrent access
-map.insert("key", "value");
-if let Some(v) = map.get(&"key") {
-    println!("Found: {}", *v);
-}
-
-// Entry API
-map.entry("counter")
-    .and_modify(|v| *v += 1)
-    .or_insert(0);
-```
-
-## Examples
-
-Run the examples with:
+Run one of the shipped examples in **debug** mode to see the diagnostics:
 
 ```bash
-# Basic RwLock usage
-cargo run --example basic_rwlock --features examples
-
-# DashMap concurrent operations  
-cargo run --example dashmap_usage --features examples
-
-# Deadlock prevention examples
-cargo run --example mutex_ordering --features examples
+cargo run --example basic_rwlock
+cargo run --example dashmap_usage
+cargo run --example mutex_ordering
 ```
 
-## How It Works
+Switch to **release** to benchmark with almost no overhead:
 
-### Debug Mode
-In debug builds, Undeadlock:
-1. Tracks lock acquisition order per thread
-2. Detects circular dependencies between locks
-3. Assigns unique IDs to each lock instance
-4. Panics with detailed diagnostics when deadlock is detected
+```bash
+cargo run --release --example basic_rwlock
+```
 
-### Release Mode  
-In release builds:
-- Deadlock detection is compiled out
-- Minimal wrapper overhead (usually just a pointer indirection)
-- Operations compile down to near-native performance
+---
 
-## Example: Concurrent Operations
+## Customising thresholds
 
-Here's how Undeadlock helps detect potential deadlocks:
+`CustomDashMap` offers an extra constructor allowing you to choose the timeout (in seconds) that is considered "too long" for a writer:
 
 ```rust
-use undeadlock::{CustomRwLock, CustomDashMap};
-
-async fn concurrent_updates(shared_data: &CustomDashMap<String, i32>) {
-    // Multiple threads can safely update different keys
-    let mut handle1 = shared_data.get_mut(&"key1".to_string());
-    let mut handle2 = shared_data.get_mut(&"key2".to_string());
-    
-    // In debug mode, holding locks too long triggers warnings
-    *handle1 += 1;
-    *handle2 += 1;
-}
-
-// Thread-safe read/write access
-async fn read_write_example(data: &CustomRwLock<Vec<i32>>) {
-    // Multiple concurrent readers
-    let reader1 = data.read().await;
-    let reader2 = data.read().await;
-    
-    drop(reader1);
-    drop(reader2);
-    
-    // Exclusive writer
-    let mut writer = data.write().await;
-    writer.push(42);
-}
+let map = CustomDashMap::new_with_timeout("my_map", 30); // 30-second threshold
 ```
 
-## Performance
+For anything else, tweak the constants at the top of `src/debug.rs` and re-compile.
 
-Benchmarks show minimal overhead:
-- **Debug mode**: ~15-20% overhead for deadlock detection
-- **Release mode**: <1% overhead compared to standard library
+There are currently no runtime knobs for `CustomRwLock`.
 
-See benchmarks in `benches/` for detailed performance analysis.
+---
 
-## Integration
+## What this crate **does not** do
 
-Undeadlock is designed to integrate seamlessly:
+* It does **not** enforce a global lock-ordering discipline.
+* It does **not** build a dependency graph to prove the absence of dead-locks.
+* It does **not** terminate your program – it only logs.
 
-```rust
-// Before
-use tokio::sync::RwLock;
-use dashmap::DashMap;
+The purpose is to surface the most common issues (holding a lock for too long, double-locking the same key, etc.) early during development without affecting production performance.
 
-// After  
-use undeadlock::{CustomRwLock as RwLock, CustomDashMap as DashMap};
-```
+---
 
-## Limitations
+## License
 
-- Deadlock detection only works within a single process
-- Cannot detect deadlocks involving external resources
-- Async code requires special handling (see async examples)
-- Some edge cases in complex lock hierarchies may not be detected
+Licensed under the Apache License, Version 2.0.  See the `LICENSE` file for details.
