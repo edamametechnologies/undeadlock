@@ -24,6 +24,7 @@ once_cell = "1.19.0"
 # Async
 tokio = { version = "1.39.2", features = ["sync", "macros", "time"] }
 dashmap = "6.0.1"
+futures = "0.3.31"
 
 # Logging
 tracing = "0.1.40"
