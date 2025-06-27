@@ -37,6 +37,7 @@ static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug)]
 struct LockInfo {
     backtrace: Backtrace,
+    caller: String,
     started_at: Instant,
     thread_id: ThreadId,
     timeout_logged: AtomicBool,
@@ -46,6 +47,7 @@ impl Clone for LockInfo {
     fn clone(&self) -> Self {
         Self {
             backtrace: Backtrace::force_capture(),
+            caller: self.caller.clone(),
             started_at: self.started_at,
             thread_id: self.thread_id,
             timeout_logged: AtomicBool::new(self.timeout_logged.load(Ordering::SeqCst)),
@@ -90,7 +92,8 @@ impl<T> CustomRwLock<T> {
         // Capture the caller's location once, outside of the async block. The
         // `#[track_caller]` attribute on this sync wrapper ensures that this
         // location reflects the exterior call-site.
-        let _loc = Location::caller();
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
 
         async move {
             // Create a tracing span carrying the caller info (only when the
@@ -99,8 +102,8 @@ impl<T> CustomRwLock<T> {
             let span = tracing::trace_span!(
                 "CustomRwLock::read",
                 lock_name = %self.name,
-                caller_file = _loc.file(),
-                caller_line = _loc.line()
+                caller_file = caller_location.file(),
+                caller_line = caller_location.line()
             );
 
             #[cfg(debug_assertions)]
@@ -147,8 +150,43 @@ impl<T> CustomRwLock<T> {
                         {
                             Ok(g) => break g,
                             Err(_) => {
+                                // Determine who currently holds the write lock (if any)
+                                let (holder_thread, holder_origin) = if let Some(info) =
+                                    self.write_lock_info.get(RW_WRITE_LOCK_KEY)
+                                {
+                                    let holder_frames = extract_useful_frames(
+                                        &format!("{:?}", info.backtrace),
+                                        true,
+                                    );
+                                    let origin = if holder_frames.is_empty() {
+                                        info.caller.clone()
+                                    } else {
+                                        let joined = holder_frames.join(" -> ");
+                                        if joined.contains("CustomRwLock")
+                                            || joined.contains("Backtrace::create")
+                                        {
+                                            info.caller.clone()
+                                        } else {
+                                            joined
+                                        }
+                                    };
+                                    (format!("{:?}", info.thread_id), origin)
+                                } else {
+                                    ("<none>".to_string(), "<released>".to_string())
+                                };
+
+                                // Dump current lock state for full details
                                 self.dump_lock_state();
-                                error!("Read lock '{}' could not be acquired within {}s (continuing to wait)", self.name, DEFAULT_RWLOCK_READ_WARNING_SECS);
+
+                                error!(
+                                    "Read lock '{}' could not be acquired within {}s by {:?} (caller: {}) – currently held by {} at: {} (continuing to wait)",
+                                    self.name,
+                                    DEFAULT_RWLOCK_READ_WARNING_SECS,
+                                    current_thread,
+                                    caller,
+                                    holder_thread,
+                                    holder_origin
+                                );
                             }
                         }
                     }
@@ -177,8 +215,11 @@ impl<T> CustomRwLock<T> {
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_RWLOCK_READ_WARNING_SECS {
                     error!(
-                        "Read lock '{}' took too long to acquire: {:?} seconds",
-                        self.name, duration
+                        "Read lock '{}' took too long to acquire: {:?} seconds by {:?} (caller: {})",
+                        self.name,
+                        duration,
+                        current_thread,
+                        caller,
                     );
                 }
             }
@@ -189,7 +230,8 @@ impl<T> CustomRwLock<T> {
 
     #[track_caller]
     pub fn write(&self) -> impl std::future::Future<Output = CustomRwLockWriteGuard<'_, T>> + '_ {
-        let _loc = Location::caller();
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
 
         async move {
             // Build the tracing span when tokio-console is enabled.
@@ -197,8 +239,8 @@ impl<T> CustomRwLock<T> {
             let span = tracing::trace_span!(
                 "CustomRwLock::write",
                 lock_name = %self.name,
-                caller_file = _loc.file(),
-                caller_line = _loc.line()
+                caller_file = caller_location.file(),
+                caller_line = caller_location.line()
             );
 
             #[cfg(debug_assertions)]
@@ -239,6 +281,7 @@ impl<T> CustomRwLock<T> {
                     RW_WRITE_LOCK_KEY.to_string(),
                     LockInfo {
                         backtrace: Backtrace::force_capture(),
+                        caller: caller.clone(),
                         started_at: Instant::now(),
                         thread_id: current_thread,
                         timeout_logged: AtomicBool::new(false),
@@ -269,8 +312,42 @@ impl<T> CustomRwLock<T> {
                         {
                             Ok(g) => break g,
                             Err(_) => {
+                                // Identify current write holder (should be same, but safe)
+                                let (holder_thread, holder_origin) = if let Some(info) =
+                                    self.write_lock_info.get(RW_WRITE_LOCK_KEY)
+                                {
+                                    let holder_frames = extract_useful_frames(
+                                        &format!("{:?}", info.backtrace),
+                                        true,
+                                    );
+                                    let origin = if holder_frames.is_empty() {
+                                        info.caller.clone()
+                                    } else {
+                                        let joined = holder_frames.join(" -> ");
+                                        if joined.contains("CustomRwLock")
+                                            || joined.contains("Backtrace::create")
+                                        {
+                                            info.caller.clone()
+                                        } else {
+                                            joined
+                                        }
+                                    };
+                                    (format!("{:?}", info.thread_id), origin)
+                                } else {
+                                    ("<none>".to_string(), "<released>".to_string())
+                                };
+
                                 self.dump_lock_state();
-                                error!("Write lock '{}' could not be acquired within {}s (continuing to wait)", self.name, DEFAULT_RWLOCK_WRITE_WARNING_SECS);
+
+                                error!(
+                                    "Write lock '{}' could not be acquired within {}s by {:?} (caller: {}) – currently held by {} at: {} (continuing to wait)",
+                                    self.name,
+                                    DEFAULT_RWLOCK_WRITE_WARNING_SECS,
+                                    current_thread,
+                                    caller,
+                                    holder_thread,
+                                    holder_origin
+                                );
                             }
                         }
                     }
@@ -298,8 +375,11 @@ impl<T> CustomRwLock<T> {
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_RWLOCK_WRITE_WARNING_SECS {
                     error!(
-                        "Write lock '{}' took too long to acquire: {:?} seconds",
-                        self.name, duration
+                        "Write lock '{}' took too long to acquire: {:?} seconds by {:?} (caller: {})",
+                        self.name,
+                        duration,
+                        current_thread,
+                        caller,
                     );
                 }
             }
@@ -557,25 +637,9 @@ fn register_map_for_global_monitor(
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                         {
-                            // Extract useful frames for context
-                            let bt_str = format!("{:?}", info.backtrace);
-                            let mut frames = extract_useful_frames(&bt_str, true);
-                            if frames.is_empty() {
-                                frames = extract_useful_frames(&bt_str, false);
-                            }
-                            let origin = if frames.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                frames.join(" -> ")
-                            };
-
                             error!(
-                                "Write lock for key {} in map '{}' STILL held after {:?} by {:?} originating at: {}",
-                                k,
-                                map_name,
-                                held,
-                                info.thread_id,
-                                origin,
+                                "Write lock for key {} in map '{}' STILL held after {:?} by {:?}",
+                                k, map_name, held, info.thread_id,
                             );
                         }
                     }
@@ -743,22 +807,13 @@ where
                 alerted = true;
                 // include holder info if available
                 if let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
-                    let holder_frames =
-                        extract_useful_frames(&format!("{:?}", ref_val.backtrace), false);
-                    let holder_msg = if holder_frames.is_empty() {
-                        "unknown holder".to_string()
-                    } else {
-                        holder_frames.join(" -> ")
-                    };
-
                     error!(
-                        "Writer WAITING for key {:?} in map '{}' for {:?}. Waiter at: {}. Currently held by {:?} originating at: {}",
+                        "Writer WAITING for key {:?} in map '{}' for {:?}. Waiter at: {}. Currently held by {:?}",
                         key,
                         self.name,
                         elapsed,
                         waiter_origin,
                         ref_val.thread_id,
-                        holder_msg,
                     );
                 } else {
                     error!(
@@ -796,6 +851,7 @@ where
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(LockInfo {
                     backtrace: Backtrace::force_capture(),
+                    caller: String::new(),
                     started_at: Instant::now(),
                     thread_id: std::thread::current().id(),
                     timeout_logged: AtomicBool::new(false),
@@ -885,6 +941,7 @@ where
                     key_str.clone(),
                     LockInfo {
                         backtrace: Backtrace::force_capture(),
+                        caller: String::new(),
                         started_at: Instant::now(),
                         thread_id: std::thread::current().id(),
                         timeout_logged: AtomicBool::new(false),
@@ -978,6 +1035,7 @@ where
                 "__CLEAR_OPERATION__".to_string(),
                 LockInfo {
                     backtrace: Backtrace::force_capture(),
+                    caller: String::new(),
                     started_at: Instant::now(),
                     thread_id: std::thread::current().id(),
                     timeout_logged: AtomicBool::new(false),
@@ -1042,6 +1100,7 @@ where
                 key.clone(),
                 LockInfo {
                     backtrace: Backtrace::force_capture(),
+                    caller: String::new(),
                     started_at: Instant::now(),
                     thread_id: std::thread::current().id(),
                     timeout_logged: AtomicBool::new(false),
@@ -1091,6 +1150,7 @@ where
                 key.clone(),
                 LockInfo {
                     backtrace: Backtrace::force_capture(),
+                    caller: String::new(),
                     started_at: Instant::now(),
                     thread_id: std::thread::current().id(),
                     timeout_logged: AtomicBool::new(false),
@@ -1203,6 +1263,7 @@ where
                 "__RETAIN_OPERATION__".to_string(),
                 LockInfo {
                     backtrace: Backtrace::force_capture(),
+                    caller: String::new(),
                     started_at: Instant::now(),
                     thread_id: std::thread::current().id(),
                     timeout_logged: AtomicBool::new(false),
@@ -1327,6 +1388,7 @@ where
                 "__DRAIN_OPERATION__".to_string(),
                 LockInfo {
                     backtrace: Backtrace::force_capture(),
+                    caller: String::new(),
                     started_at: Instant::now(), // Lock acquisition time
                     thread_id: std::thread::current().id(),
                     timeout_logged: AtomicBool::new(false),
