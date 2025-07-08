@@ -30,7 +30,7 @@ Add the crate and (optionally) enable the `tokio-console` feature to propagate c
 
 ```toml
 [dependencies]
-undeadlock = { path = "../undeadlock", features = ["tokio-console"] }
+undeadlock = { version = "0.1", features = ["tokio-console"] }
 ```
 
 Replace your existing locks:
@@ -67,7 +67,8 @@ async fn main() {
     // shared counter
     let counter = Arc::new(CustomRwLock::new(0u64));
 
-    // … spawn some tasks that stress the locks …
+    // spawn some tasks that stress the locks
+    // your application code here
 }
 ```
 
@@ -95,9 +96,7 @@ cargo run --release --example basic_rwlock
 let map = CustomDashMap::new_with_timeout("my_map", 30); // 30-second threshold
 ```
 
-For anything else, tweak the constants at the top of `src/debug.rs` and re-compile.
-
-There are currently no runtime knobs for `CustomRwLock`.
+For `CustomRwLock` thresholds, modify the constants in `src/debug.rs` and recompile.
 
 ---
 

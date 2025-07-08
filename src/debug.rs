@@ -13,7 +13,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 // Bring in caller location utilities. `Location` is always available, while
 // `tracing::Instrument` is only needed when the `tokio-console` feature is
@@ -120,10 +120,6 @@ impl<T> CustomRwLock<T> {
             #[cfg(debug_assertions)]
             if self.write_locked.load(Ordering::SeqCst) {
                 self.read_waiting_count.fetch_add(1, Ordering::SeqCst);
-                debug!(
-                    "Read lock '{}' is waiting for a write lock to be released",
-                    self.name
-                );
             }
 
             // Await the underlying lock, instrumented with the span when
@@ -179,7 +175,7 @@ impl<T> CustomRwLock<T> {
                                 self.dump_lock_state();
 
                                 error!(
-                                    "Read lock '{}' could not be acquired within {}s by {:?} (caller: {}) – currently held by {} at: {} (continuing to wait)",
+                                    "Read lock '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (continuing to wait)",
                                     self.name,
                                     DEFAULT_RWLOCK_READ_WARNING_SECS,
                                     current_thread,
@@ -215,11 +211,8 @@ impl<T> CustomRwLock<T> {
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_RWLOCK_READ_WARNING_SECS {
                     error!(
-                        "Read lock '{}' took too long to acquire: {:?} seconds by {:?} (caller: {})",
-                        self.name,
-                        duration,
-                        current_thread,
-                        caller,
+                        "Read lock '{}' took too long to acquire: {:?} by thread {:?} (caller: {})",
+                        self.name, duration, current_thread, caller,
                     );
                 }
             }
@@ -253,26 +246,11 @@ impl<T> CustomRwLock<T> {
             {
                 self.waiters.insert(current_thread, "write".to_string());
                 if self.write_locked.load(Ordering::SeqCst) {
-                    let bt = Backtrace::force_capture();
-                    let bt_str = format!("{:?}", bt);
-
                     // Skip undeadlock.rs frames first
-                    let mut frames = extract_useful_frames(&bt_str, true);
 
-                    // Include undeadlock.rs if no frames found
-                    if frames.is_empty() {
-                        frames = extract_useful_frames(&bt_str, false);
-                    }
-
-                    let frame_msg = if frames.is_empty() {
-                        "from unknown source".to_string()
-                    } else {
-                        format!("from:\n{}", frames.join("\n"))
-                    };
-
-                    debug!(
-                        "Attempted to acquire write lock for '{}' while another write lock is already active - {}",
-                        self.name, frame_msg
+                    warn!(
+                        "Write lock for '{}' already active when attempting to acquire another",
+                        self.name
                     );
                 }
 
@@ -340,7 +318,7 @@ impl<T> CustomRwLock<T> {
                                 self.dump_lock_state();
 
                                 error!(
-                                    "Write lock '{}' could not be acquired within {}s by {:?} (caller: {}) – currently held by {} at: {} (continuing to wait)",
+                                    "Write lock '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (continuing to wait)",
                                     self.name,
                                     DEFAULT_RWLOCK_WRITE_WARNING_SECS,
                                     current_thread,
@@ -375,7 +353,7 @@ impl<T> CustomRwLock<T> {
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_RWLOCK_WRITE_WARNING_SECS {
                     error!(
-                        "Write lock '{}' took too long to acquire: {:?} seconds by {:?} (caller: {})",
+                        "Write lock '{}' took too long to acquire: {:?} by thread {:?} (caller: {})",
                         self.name,
                         duration,
                         current_thread,
@@ -406,20 +384,18 @@ impl<T> CustomRwLock<T> {
     pub fn dump_lock_state(&self) {
         #[cfg(debug_assertions)]
         {
-            warn!("===== Dumping CustomRwLock '{}' state =====", self.name);
+            warn!("Lock state dump for '{}':", self.name);
             if let Some(info) = self.write_lock_info.get(RW_WRITE_LOCK_KEY) {
                 warn!(
-                    "WRITE LOCK held for {:?} by {:?}\nbacktrace:\n{:?}",
+                    "Write lock held for {:?} by thread {:?}",
                     info.started_at.elapsed(),
                     info.thread_id,
-                    info.backtrace
                 );
             }
             for waiter in self.waiters.iter() {
                 let (thread_id, kind) = waiter.pair();
-                warn!("WAITER thread={:?} kind={} ", thread_id, kind);
+                warn!("Waiter thread {:?} waiting for {}", thread_id, kind);
             }
-            warn!("===== End CustomRwLock dump =====");
         }
     }
 }
@@ -638,7 +614,7 @@ fn register_map_for_global_monitor(
                             .is_ok()
                         {
                             error!(
-                                "Write lock for key {} in map '{}' STILL held after {:?} by {:?}",
+                                "Write lock for key {} in map '{}' held after {:?} by thread {:?}",
                                 k, map_name, held, info.thread_id,
                             );
                         }
@@ -751,26 +727,10 @@ where
     {
         let key_str = self.get_key_identifier(key);
         if let Some(ref_val) = self.write_locked_keys.get(&key_str) {
-            let bt_str = format!("{:?}", ref_val.backtrace);
-
-            // First pass: exclude undeadlock.rs frames
-            let mut frames = extract_useful_frames(&bt_str, true);
-
-            if frames.is_empty() {
-                frames = extract_useful_frames(&bt_str, false);
-            }
-
-            let frame_msg = if frames.is_empty() {
-                "from unknown source".to_string()
-            } else {
-                format!("from:\n{}", frames.join("\n"))
-            };
-
-            debug!(
-                "Attempted to write to key {:?} in map '{}' while another write operation is already active - {} (held for {:?} by {:?})",
+            warn!(
+                "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?})",
                 key,
                 self.name,
-                frame_msg,
                 ref_val.started_at.elapsed(),
                 ref_val.thread_id,
             );
@@ -808,7 +768,7 @@ where
                 // include holder info if available
                 if let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
                     error!(
-                        "Writer WAITING for key {:?} in map '{}' for {:?}. Waiter at: {}. Currently held by {:?}",
+                        "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, currently held by thread {:?}",
                         key,
                         self.name,
                         elapsed,
@@ -817,7 +777,7 @@ where
                     );
                 } else {
                     error!(
-                        "Writer WAITING for key {:?} in map '{}' for {:?}. Waiter at: {}. Holder info not found (lock cleared meanwhile)",
+                        "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, holder info not found",
                         key,
                         self.name,
                         elapsed,
@@ -1290,25 +1250,23 @@ where
     pub fn dump_lock_state(&self) {
         #[cfg(debug_assertions)]
         {
-            warn!("===== Dumping lock state for map '{}' =====", self.name);
+            warn!("Lock state dump for map '{}':", self.name);
 
             let now = Instant::now();
             for item in self.write_locked_keys.iter() {
                 let (k, info) = item.pair();
                 warn!(
-                    "LOCK HELD key={}  held_for={:?}  by={:?}\nbacktrace:\n{:?}",
+                    "Lock held: key={}, duration={:?}, thread={:?}",
                     k,
                     now.duration_since(info.started_at),
                     info.thread_id,
-                    info.backtrace
                 );
             }
 
             for waiter in self.waiters.iter() {
                 let (thread_id, k) = waiter.pair();
-                warn!("WAITER thread={:?} waiting_for key={}", thread_id, k);
+                warn!("Waiter: thread={:?}, waiting_for={}", thread_id, k);
             }
-            warn!("===== End lock state dump =====");
         }
     }
 
