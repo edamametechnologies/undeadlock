@@ -51,6 +51,10 @@ required-features = ["examples"]
 name = "mutex_ordering"
 required-features = ["examples"]
 
+[[example]]
+name = "basic_mutex"
+required-features = ["examples"]
+
 [lib]
 name = "undeadlock"
 path = "src/lib.rs" 
