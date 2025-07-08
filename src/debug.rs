@@ -11,7 +11,7 @@ use std::sync::{Arc, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tracing::{error, warn};
 
@@ -25,10 +25,12 @@ use tracing::Instrument;
 // Define constants for timeouts and warning thresholds
 const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 10;
 const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 15;
+const DEFAULT_MUTEX_WARNING_SECS: u64 = 15;
 const DEFAULT_DASHMAP_OP_WARNING_SECS: u64 = 1;
 const DEFAULT_DASHMAP_WRITE_LOCK_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 10;
 const RW_WRITE_LOCK_KEY: &str = "__WRITE__";
+const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
 // Unique counter for iterator tracking keys
 static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -425,6 +427,220 @@ impl<'a, T> Drop for CustomRwLockWriteGuard<'a, T> {
         {
             self.parent.write_locked.store(false, Ordering::SeqCst);
             self.parent.write_lock_info.remove(RW_WRITE_LOCK_KEY);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CustomMutex<T> {
+    name: String,
+    lock: Mutex<T>,
+    #[cfg(debug_assertions)]
+    locked: AtomicBool,
+    #[cfg(debug_assertions)]
+    lock_info: DashMap<String, LockInfo>,
+    #[cfg(debug_assertions)]
+    waiters: DashMap<ThreadId, String>,
+}
+
+impl<T> CustomMutex<T> {
+    pub fn new(data: T) -> Self {
+        Self {
+            name: type_name::<T>().to_string(),
+            lock: Mutex::new(data),
+            #[cfg(debug_assertions)]
+            locked: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            lock_info: DashMap::new(),
+            #[cfg(debug_assertions)]
+            waiters: DashMap::new(),
+        }
+    }
+
+    #[track_caller]
+    pub fn lock(&self) -> impl std::future::Future<Output = CustomMutexGuard<'_, T>> + '_ {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
+
+        async move {
+            // Build the tracing span when tokio-console is enabled.
+            #[cfg(feature = "tokio-console")]
+            let span = tracing::trace_span!(
+                "CustomMutex::lock",
+                lock_name = %self.name,
+                caller_file = caller_location.file(),
+                caller_line = caller_location.line()
+            );
+
+            #[cfg(debug_assertions)]
+            let start = Instant::now();
+
+            #[cfg(debug_assertions)]
+            let current_thread = std::thread::current().id();
+
+            #[cfg(debug_assertions)]
+            {
+                self.waiters.insert(current_thread, "mutex".to_string());
+                if self.locked.load(Ordering::SeqCst) {
+                    warn!(
+                        "Mutex for '{}' already active when attempting to acquire another",
+                        self.name
+                    );
+                }
+
+                self.locked.store(true, Ordering::SeqCst);
+                self.lock_info.insert(
+                    MUTEX_LOCK_KEY.to_string(),
+                    LockInfo {
+                        backtrace: Backtrace::force_capture(),
+                        caller: caller.clone(),
+                        started_at: Instant::now(),
+                        thread_id: current_thread,
+                        timeout_logged: AtomicBool::new(false),
+                    },
+                );
+            }
+
+            // Await lock with timeout
+            let guard = {
+                #[cfg(debug_assertions)]
+                {
+                    loop {
+                        let fut = {
+                            #[cfg(feature = "tokio-console")]
+                            {
+                                self.lock.lock().instrument(span)
+                            }
+                            #[cfg(not(feature = "tokio-console"))]
+                            {
+                                self.lock.lock()
+                            }
+                        };
+                        match time::timeout(Duration::from_secs(DEFAULT_MUTEX_WARNING_SECS), fut)
+                            .await
+                        {
+                            Ok(g) => break g,
+                            Err(_) => {
+                                // Identify current lock holder
+                                let (holder_thread, holder_origin) =
+                                    if let Some(info) = self.lock_info.get(MUTEX_LOCK_KEY) {
+                                        let holder_frames = extract_useful_frames(
+                                            &format!("{:?}", info.backtrace),
+                                            true,
+                                        );
+                                        let origin = if holder_frames.is_empty() {
+                                            info.caller.clone()
+                                        } else {
+                                            let joined = holder_frames.join(" -> ");
+                                            if joined.contains("CustomMutex")
+                                                || joined.contains("Backtrace::create")
+                                            {
+                                                info.caller.clone()
+                                            } else {
+                                                joined
+                                            }
+                                        };
+                                        (format!("{:?}", info.thread_id), origin)
+                                    } else {
+                                        ("<none>".to_string(), "<released>".to_string())
+                                    };
+
+                                self.dump_lock_state();
+
+                                error!(
+                                    "Mutex '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (continuing to wait)",
+                                    self.name,
+                                    DEFAULT_MUTEX_WARNING_SECS,
+                                    current_thread,
+                                    caller,
+                                    holder_thread,
+                                    holder_origin
+                                );
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(not(debug_assertions))]
+                {
+                    #[cfg(feature = "tokio-console")]
+                    {
+                        self.lock.lock().instrument(span).await
+                    }
+                    #[cfg(not(feature = "tokio-console"))]
+                    {
+                        self.lock.lock().await
+                    }
+                }
+            };
+
+            #[cfg(debug_assertions)]
+            {
+                self.locked.store(false, Ordering::SeqCst);
+                self.lock_info.remove(MUTEX_LOCK_KEY);
+                self.waiters.remove(&current_thread);
+                // Check acquisition time
+                let duration = start.elapsed();
+                if duration.as_secs() > DEFAULT_MUTEX_WARNING_SECS {
+                    error!(
+                        "Mutex '{}' took too long to acquire: {:?} by thread {:?} (caller: {})",
+                        self.name, duration, current_thread, caller,
+                    );
+                }
+            }
+
+            CustomMutexGuard {
+                inner: guard,
+                parent: self,
+            }
+        }
+    }
+
+    /// Dumps current state (lock info + waiters) for diagnostics
+    pub fn dump_lock_state(&self) {
+        #[cfg(debug_assertions)]
+        {
+            warn!("Mutex state dump for '{}':", self.name);
+            if let Some(info) = self.lock_info.get(MUTEX_LOCK_KEY) {
+                warn!(
+                    "Mutex lock held for {:?} by thread {:?}",
+                    info.started_at.elapsed(),
+                    info.thread_id,
+                );
+            }
+            for waiter in self.waiters.iter() {
+                let (thread_id, kind) = waiter.pair();
+                warn!("Waiter thread {:?} waiting for {}", thread_id, kind);
+            }
+        }
+    }
+}
+
+/// Wrapper guard that clears mutex lock bookkeeping on drop
+pub struct CustomMutexGuard<'a, T> {
+    inner: tokio::sync::MutexGuard<'a, T>,
+    parent: &'a CustomMutex<T>,
+}
+
+impl<'a, T> std::ops::Deref for CustomMutexGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for CustomMutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'a, T> Drop for CustomMutexGuard<'a, T> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.parent.locked.store(false, Ordering::SeqCst);
+            self.parent.lock_info.remove(MUTEX_LOCK_KEY);
         }
     }
 }
@@ -1479,6 +1695,9 @@ impl<I> Drop for TimedIter<I> {
 // Forwarding the auto-traits therefore upholds the required invariants.
 unsafe impl<T: Send + Sync> Send for CustomRwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for CustomRwLock<T> {}
+
+unsafe impl<T: Send + Sync> Send for CustomMutex<T> {}
+unsafe impl<T: Send + Sync> Sync for CustomMutex<T> {}
 
 unsafe impl<'a, K, V> Send for CustomRefMut<'a, K, V>
 where

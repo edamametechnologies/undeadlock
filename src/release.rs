@@ -1,13 +1,19 @@
 use dashmap::DashMap;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// In release builds we skip the heavy debugging wrappers and simply
 /// re-export the standard Tokio `RwLock`.
 /// All APIs (`new`, `read`, `write`, etc.) are therefore identical and zero-cost.
 #[allow(dead_code)]
 pub type CustomRwLock<T> = RwLock<T>;
+
+/// In release builds we skip the heavy debugging wrappers and simply
+/// re-export the standard Tokio `Mutex`.
+/// All APIs (`new`, `lock`, etc.) are therefore identical and zero-cost.
+#[allow(dead_code)]
+pub type CustomMutex<T> = Mutex<T>;
 
 /// Thin wrapper around `DashMap` so that we can keep using the existing
 /// `CustomDashMap::new` and `CustomDashMap::new_with_timeout` constructors

@@ -1,11 +1,12 @@
 # Undeadlock
 
-Light-weight diagnostic wrappers around `tokio::sync::RwLock` and `dashmap::DashMap` that help you discover lock contention and potential dead-locks while developing.
+Light-weight diagnostic wrappers around `tokio::sync::RwLock`, `tokio::sync::Mutex`, and `dashmap::DashMap` that help you discover lock contention and potential dead-locks while developing.
 
 In **debug** builds the wrappers gather rich runtime information (back-traces, timestamps, thread-ids, locked keys, …) and emit `tracing` warnings or errors whenever:
 
 * acquiring a read lock takes longer than **10 s**;
 * acquiring a write lock takes longer than **15 s**;
+* acquiring a mutex lock takes longer than **15 s**;
 * a `CustomDashMap` key is still held after **10 s** by another writer;
 * an instrumented map/lock operation itself runs for more than **1 s**.
 
@@ -16,6 +17,7 @@ In **release** builds all of the additional bookkeeping is compiled out and the 
 ```rust
 // release mode
 pub type CustomRwLock<T> = tokio::sync::RwLock<T>;
+pub type CustomMutex<T> = tokio::sync::Mutex<T>;
 
 pub struct CustomDashMap<K, V>(dashmap::DashMap<K, V>);
 ```
@@ -36,11 +38,12 @@ undeadlock = { version = "0.1", features = ["tokio-console"] }
 Replace your existing locks:
 
 ```rust
-use tokio::sync::RwLock;        // ❌
-use dashmap::DashMap;           // ❌
+use tokio::sync::{RwLock, Mutex}; // ❌
+use dashmap::DashMap;             // ❌
 
-use undeadlock::{               // ✅
+use undeadlock::{                 // ✅
     CustomRwLock as RwLock,
+    CustomMutex as Mutex,
     CustomDashMap as DashMap,
 };
 ```
@@ -52,7 +55,7 @@ Everything else keeps compiling unchanged.
 ## Quick example
 
 ```rust
-use undeadlock::{CustomDashMap, CustomRwLock};
+use undeadlock::{CustomDashMap, CustomRwLock, CustomMutex};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -64,8 +67,11 @@ async fn main() {
     let users = Arc::new(CustomDashMap::new("users"));
     users.insert("alice", 0);
 
-    // shared counter
+    // shared counter with read/write access
     let counter = Arc::new(CustomRwLock::new(0u64));
+    
+    // shared resource with exclusive access
+    let resource = Arc::new(CustomMutex::new("shared_data".to_string()));
 
     // spawn some tasks that stress the locks
     // your application code here
@@ -75,15 +81,17 @@ async fn main() {
 Run one of the shipped examples in **debug** mode to see the diagnostics:
 
 ```bash
-cargo run --example basic_rwlock
-cargo run --example dashmap_usage
-cargo run --example mutex_ordering
+cargo run --example basic_rwlock --features examples
+cargo run --example basic_mutex --features examples
+cargo run --example dashmap_usage --features examples
+cargo run --example mutex_ordering --features examples
 ```
 
 Switch to **release** to benchmark with almost no overhead:
 
 ```bash
-cargo run --release --example basic_rwlock
+cargo run --release --example basic_rwlock --features examples
+cargo run --release --example basic_mutex --features examples
 ```
 
 ---
@@ -96,7 +104,13 @@ cargo run --release --example basic_rwlock
 let map = CustomDashMap::new_with_timeout("my_map", 30); // 30-second threshold
 ```
 
-For `CustomRwLock` thresholds, modify the constants in `src/debug.rs` and recompile.
+For `CustomRwLock` and `CustomMutex` thresholds, modify the constants in `src/debug.rs` and recompile:
+
+```rust
+const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 10;   // read lock timeout
+const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 15;  // write lock timeout  
+const DEFAULT_MUTEX_WARNING_SECS: u64 = 15;         // mutex lock timeout
+```
 
 ---
 
