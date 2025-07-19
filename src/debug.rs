@@ -23,18 +23,18 @@ use std::panic::Location;
 use tracing::Instrument;
 
 // Define constants for timeouts and warning thresholds
-const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 10;
-const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 15;
-const DEFAULT_MUTEX_WARNING_SECS: u64 = 15;
+const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 1; // Reduced from 10s
+const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 2; // Reduced from 15s
+const DEFAULT_MUTEX_WARNING_SECS: u64 = 2; // Reduced from 15s
 const DEFAULT_DASHMAP_OP_WARNING_SECS: u64 = 1;
-const DEFAULT_DASHMAP_WRITE_LOCK_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 10;
+const DEFAULT_DASHMAP_WRITE_LOCK_TIMEOUT_SECS: u64 = 3; // Reduced from 10s
+const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 1; // Reduced from 10ms to 1ms
 const RW_WRITE_LOCK_KEY: &str = "__WRITE__";
 const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
 // Sampling configuration for backtrace capture
-const BACKTRACE_SAMPLE_RATE: u64 = 100; // Capture 1 in every N operations
-const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 5; // Minimum interval between samples
+const BACKTRACE_SAMPLE_RATE: u64 = 1000; // Reduced from 1% to 0.1% (1 in 1000)
+const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 30; // Increased from 5s to 30s
 
 // Unique counter for iterator tracking keys
 static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -893,7 +893,7 @@ fn register_map_for_global_monitor(
     // Spawn monitor thread once
     MONITOR_INIT.call_once(|| {
         std::thread::spawn(|| loop {
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(5)); // Reduced frequency from 1s to 5s
             let now = Instant::now();
             for entry in MONITORED_MAPS.iter() {
                 let (map_name, (keys, timeout)) = entry.pair();
@@ -1044,16 +1044,11 @@ where
         let key_str_wait = self.get_key_identifier(key);
         self.waiters.insert(current_thread, key_str_wait.clone());
 
-        // Capture backtrace of the *writer waiting*, to make the log actionable
-        let waiter_bt = Backtrace::force_capture();
-        let waiter_bt_frames = extract_useful_frames(&format!("{:?}", waiter_bt), true);
-        let waiter_origin = if waiter_bt_frames.is_empty() {
-            "unknown".to_string()
-        } else {
-            waiter_bt_frames.join(" -> ")
-        };
+        // Skip expensive backtrace capture during frequent contention
+        let waiter_origin = "waiting_thread".to_string();
 
         let mut alerted = false;
+        let mut spin_count = 0;
         while self.check_write_lock(key) {
             let elapsed = start.elapsed();
             if !alerted && elapsed.as_secs() > self.write_lock_timeout_secs {
@@ -1079,9 +1074,17 @@ where
                 }
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(
-                DEFAULT_LOCK_WAIT_SLEEP_MILLIS,
-            ));
+            // Spin a few times before sleeping to avoid context switches for short waits
+            spin_count += 1;
+            if spin_count < 100 {
+                std::hint::spin_loop(); // CPU hint for spin waiting
+            } else {
+                // Reset spin count and sleep briefly
+                spin_count = 0;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    DEFAULT_LOCK_WAIT_SLEEP_MILLIS,
+                ));
+            }
         }
 
         self.waiters.remove(&current_thread);
@@ -1564,6 +1567,7 @@ where
                     return Err(());
                 }
 
+                // Use shorter sleep to reduce blocking
                 std::thread::sleep(Duration::from_millis(DEFAULT_LOCK_WAIT_SLEEP_MILLIS));
             }
         }
