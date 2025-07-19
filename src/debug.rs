@@ -133,7 +133,7 @@ impl<T> CustomRwLock<T> {
                         let fut = {
                             #[cfg(feature = "tokio-console")]
                             {
-                                self.lock.read().instrument(span)
+                                self.lock.read().instrument(span.clone())
                             }
                             #[cfg(not(feature = "tokio-console"))]
                             {
@@ -277,7 +277,7 @@ impl<T> CustomRwLock<T> {
                         let fut = {
                             #[cfg(feature = "tokio-console")]
                             {
-                                self.lock.write().instrument(span)
+                                self.lock.write().instrument(span.clone())
                             }
                             #[cfg(not(feature = "tokio-console"))]
                             {
@@ -509,7 +509,7 @@ impl<T> CustomMutex<T> {
                         let fut = {
                             #[cfg(feature = "tokio-console")]
                             {
-                                self.lock.lock().instrument(span)
+                                self.lock.lock().instrument(span.clone())
                             }
                             #[cfg(not(feature = "tokio-console"))]
                             {
