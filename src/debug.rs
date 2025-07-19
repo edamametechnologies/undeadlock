@@ -32,29 +32,100 @@ const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 10;
 const RW_WRITE_LOCK_KEY: &str = "__WRITE__";
 const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
+// Sampling configuration for backtrace capture
+const BACKTRACE_SAMPLE_RATE: u64 = 100; // Capture 1 in every N operations
+const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 5; // Minimum interval between samples
+
 // Unique counter for iterator tracking keys
 static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// Sampling counters for backtrace capture
+static BACKTRACE_SAMPLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static LAST_BACKTRACE_SAMPLE_TIME: AtomicUsize = AtomicUsize::new(0);
 
 /// Information stored for each active write lock
 #[derive(Debug)]
 struct LockInfo {
-    backtrace: Backtrace,
+    backtrace: Option<Backtrace>,
     caller: String,
     started_at: Instant,
     thread_id: ThreadId,
     timeout_logged: AtomicBool,
 }
 
+impl LockInfo {
+    /// Creates a new LockInfo with optional backtrace based on sampling
+    fn new_sampled(caller: String) -> Self {
+        let should_capture = should_sample_backtrace();
+        Self {
+            backtrace: if should_capture {
+                Some(Backtrace::force_capture())
+            } else {
+                None
+            },
+            caller,
+            started_at: Instant::now(),
+            thread_id: std::thread::current().id(),
+            timeout_logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Creates a new LockInfo without backtrace (for read operations)
+    fn new_without_backtrace(caller: String) -> Self {
+        Self {
+            backtrace: None,
+            caller,
+            started_at: Instant::now(),
+            thread_id: std::thread::current().id(),
+            timeout_logged: AtomicBool::new(false),
+        }
+    }
+}
+
 impl Clone for LockInfo {
     fn clone(&self) -> Self {
+        // Backtrace doesn't implement Clone, so we need to capture a new one if the original had one
+        let backtrace = if self.backtrace.is_some() {
+            Some(Backtrace::force_capture())
+        } else {
+            None
+        };
         Self {
-            backtrace: Backtrace::force_capture(),
+            backtrace,
             caller: self.caller.clone(),
             started_at: self.started_at,
             thread_id: self.thread_id,
             timeout_logged: AtomicBool::new(self.timeout_logged.load(Ordering::SeqCst)),
         }
     }
+}
+
+/// Determines whether to capture a backtrace based on sampling logic
+fn should_sample_backtrace() -> bool {
+    let count = BACKTRACE_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Sample every Nth operation
+    if count % (BACKTRACE_SAMPLE_RATE as usize) == 0 {
+        return true;
+    }
+
+    // Also sample if enough time has passed since last sample
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as usize;
+
+    let last_sample = LAST_BACKTRACE_SAMPLE_TIME.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last_sample) >= BACKTRACE_SAMPLE_MIN_INTERVAL_SECS as usize {
+        if LAST_BACKTRACE_SAMPLE_TIME
+            .compare_exchange(last_sample, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Default)]
@@ -152,10 +223,16 @@ impl<T> CustomRwLock<T> {
                                 let (holder_thread, holder_origin) = if let Some(info) =
                                     self.write_lock_info.get(RW_WRITE_LOCK_KEY)
                                 {
-                                    let holder_frames = extract_useful_frames(
-                                        &format!("{:?}", info.backtrace),
-                                        true,
-                                    );
+                                    let backtrace_for_analysis = info
+                                        .backtrace
+                                        .as_ref()
+                                        .map(|bt| format!("{:?}", bt))
+                                        .unwrap_or_else(|| {
+                                            // Capture backtrace now for timeout analysis if not already captured
+                                            format!("{:?}", Backtrace::force_capture())
+                                        });
+                                    let holder_frames =
+                                        extract_useful_frames(&backtrace_for_analysis, true);
                                     let origin = if holder_frames.is_empty() {
                                         info.caller.clone()
                                     } else {
@@ -259,13 +336,7 @@ impl<T> CustomRwLock<T> {
                 self.write_locked.store(true, Ordering::SeqCst);
                 self.write_lock_info.insert(
                     RW_WRITE_LOCK_KEY.to_string(),
-                    LockInfo {
-                        backtrace: Backtrace::force_capture(),
-                        caller: caller.clone(),
-                        started_at: Instant::now(),
-                        thread_id: current_thread,
-                        timeout_logged: AtomicBool::new(false),
-                    },
+                    LockInfo::new_sampled(caller.clone()),
                 );
             }
 
@@ -296,10 +367,16 @@ impl<T> CustomRwLock<T> {
                                 let (holder_thread, holder_origin) = if let Some(info) =
                                     self.write_lock_info.get(RW_WRITE_LOCK_KEY)
                                 {
-                                    let holder_frames = extract_useful_frames(
-                                        &format!("{:?}", info.backtrace),
-                                        true,
-                                    );
+                                    let backtrace_for_analysis = info
+                                        .backtrace
+                                        .as_ref()
+                                        .map(|bt| format!("{:?}", bt))
+                                        .unwrap_or_else(|| {
+                                            // Capture backtrace now for timeout analysis if not already captured
+                                            format!("{:?}", Backtrace::force_capture())
+                                        });
+                                    let holder_frames =
+                                        extract_useful_frames(&backtrace_for_analysis, true);
                                     let origin = if holder_frames.is_empty() {
                                         info.caller.clone()
                                     } else {
@@ -491,13 +568,7 @@ impl<T> CustomMutex<T> {
                 self.locked.store(true, Ordering::SeqCst);
                 self.lock_info.insert(
                     MUTEX_LOCK_KEY.to_string(),
-                    LockInfo {
-                        backtrace: Backtrace::force_capture(),
-                        caller: caller.clone(),
-                        started_at: Instant::now(),
-                        thread_id: current_thread,
-                        timeout_logged: AtomicBool::new(false),
-                    },
+                    LockInfo::new_sampled(caller.clone()),
                 );
             }
 
@@ -524,10 +595,16 @@ impl<T> CustomMutex<T> {
                                 // Identify current lock holder
                                 let (holder_thread, holder_origin) =
                                     if let Some(info) = self.lock_info.get(MUTEX_LOCK_KEY) {
-                                        let holder_frames = extract_useful_frames(
-                                            &format!("{:?}", info.backtrace),
-                                            true,
-                                        );
+                                        let backtrace_for_analysis = info
+                                            .backtrace
+                                            .as_ref()
+                                            .map(|bt| format!("{:?}", bt))
+                                            .unwrap_or_else(|| {
+                                                // Capture backtrace now for timeout analysis if not already captured
+                                                format!("{:?}", Backtrace::force_capture())
+                                            });
+                                        let holder_frames =
+                                            extract_useful_frames(&backtrace_for_analysis, true);
                                         let origin = if holder_frames.is_empty() {
                                             info.caller.clone()
                                         } else {
@@ -1025,13 +1102,7 @@ where
                 // someone else already tracking – no need to spawn another checker
             }
             dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(LockInfo {
-                    backtrace: Backtrace::force_capture(),
-                    caller: String::new(),
-                    started_at: Instant::now(),
-                    thread_id: std::thread::current().id(),
-                    timeout_logged: AtomicBool::new(false),
-                });
+                v.insert(LockInfo::new_sampled(String::new()));
 
                 // per-lock checker removed; global monitor thread handles timeouts
             }
@@ -1115,13 +1186,7 @@ where
                 // register read lock
                 self.write_locked_keys.insert(
                     key_str.clone(),
-                    LockInfo {
-                        backtrace: Backtrace::force_capture(),
-                        caller: String::new(),
-                        started_at: Instant::now(),
-                        thread_id: std::thread::current().id(),
-                        timeout_logged: AtomicBool::new(false),
-                    },
+                    LockInfo::new_without_backtrace(String::new()),
                 );
                 CustomRef {
                     inner: r,
@@ -1209,13 +1274,7 @@ where
             // For clear, we lock the entire map
             self.write_locked_keys.insert(
                 "__CLEAR_OPERATION__".to_string(),
-                LockInfo {
-                    backtrace: Backtrace::force_capture(),
-                    caller: String::new(),
-                    started_at: Instant::now(),
-                    thread_id: std::thread::current().id(),
-                    timeout_logged: AtomicBool::new(false),
-                },
+                LockInfo::new_sampled(String::new()),
             );
         }
 
@@ -1272,16 +1331,8 @@ where
             // Register iterator in write_locked_keys so the global monitor can track it
             let iter_id = ITER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let key = format!("__ITER__{}", iter_id);
-            self.write_locked_keys.insert(
-                key.clone(),
-                LockInfo {
-                    backtrace: Backtrace::force_capture(),
-                    caller: String::new(),
-                    started_at: Instant::now(),
-                    thread_id: std::thread::current().id(),
-                    timeout_logged: AtomicBool::new(false),
-                },
-            );
+            self.write_locked_keys
+                .insert(key.clone(), LockInfo::new_sampled(String::new()));
 
             TimedIter {
                 inner: it,
@@ -1322,16 +1373,8 @@ where
             }
             let iter_id = ITER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let key = format!("__ITER__{}", iter_id);
-            self.write_locked_keys.insert(
-                key.clone(),
-                LockInfo {
-                    backtrace: Backtrace::force_capture(),
-                    caller: String::new(),
-                    started_at: Instant::now(),
-                    thread_id: std::thread::current().id(),
-                    timeout_logged: AtomicBool::new(false),
-                },
-            );
+            self.write_locked_keys
+                .insert(key.clone(), LockInfo::new_sampled(String::new()));
 
             TimedIter {
                 inner: it,
@@ -1437,13 +1480,7 @@ where
             // For retain, we lock the entire map since it can modify any key
             self.write_locked_keys.insert(
                 "__RETAIN_OPERATION__".to_string(),
-                LockInfo {
-                    backtrace: Backtrace::force_capture(),
-                    caller: String::new(),
-                    started_at: Instant::now(),
-                    thread_id: std::thread::current().id(),
-                    timeout_logged: AtomicBool::new(false),
-                },
+                LockInfo::new_sampled(String::new()),
             );
         }
 
@@ -1560,13 +1597,7 @@ where
             // For drain, we acquire a conceptual lock on the entire map
             self.write_locked_keys.insert(
                 "__DRAIN_OPERATION__".to_string(),
-                LockInfo {
-                    backtrace: Backtrace::force_capture(),
-                    caller: String::new(),
-                    started_at: Instant::now(), // Lock acquisition time
-                    thread_id: std::thread::current().id(),
-                    timeout_logged: AtomicBool::new(false),
-                },
+                LockInfo::new_sampled(String::new()),
             );
         }
 
