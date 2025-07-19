@@ -2,7 +2,7 @@
 
 Light-weight diagnostic wrappers around `tokio::sync::RwLock`, `tokio::sync::Mutex`, and `dashmap::DashMap` that help you discover lock contention and potential dead-locks while developing.
 
-In **debug** builds the wrappers gather rich runtime information (back-traces, timestamps, thread-ids, locked keys, …) and emit `tracing` warnings or errors whenever:
+In **debug** builds the wrappers gather rich runtime information (back-traces via sampling, timestamps, thread-ids, locked keys, …) and emit `tracing` warnings or errors whenever:
 
 * acquiring a read lock takes longer than **10 s**;
 * acquiring a write lock takes longer than **15 s**;
@@ -11,6 +11,15 @@ In **debug** builds the wrappers gather rich runtime information (back-traces, t
 * an instrumented map/lock operation itself runs for more than **1 s**.
 
 The code never panics or aborts – it merely logs – so program semantics are unchanged.  You get actionable diagnostics without risking new failures.
+
+### Performance-Optimized Sampling
+
+To minimize overhead while maintaining diagnostic capabilities, the library uses **sampling-based backtrace collection**:
+
+* **Read operations**: No backtraces captured (maximum performance for most frequent operations)
+* **Write operations**: Backtraces captured for ~1% of operations (1 in 100 by default)
+* **Timeout scenarios**: Always capture full diagnostic information when actually needed
+* **Time-based sampling**: Ensures coverage even with low operation counts
 
 In **release** builds all of the additional bookkeeping is compiled out and the types collapse to the plain primitives:
 
@@ -22,7 +31,7 @@ pub type CustomMutex<T> = tokio::sync::Mutex<T>;
 pub struct CustomDashMap<K, V>(dashmap::DashMap<K, V>);
 ```
 
-The overhead is therefore virtually zero.
+The **release build** overhead is therefore virtually zero. In **debug builds**, the sampling-based approach keeps overhead minimal while preserving diagnostic capabilities.
 
 ---
 
@@ -75,6 +84,9 @@ async fn main() {
 
     // spawn some tasks that stress the locks
     // your application code here
+    
+    // In debug builds: minimal overhead due to sampling-based diagnostics
+    // In release builds: zero overhead - compiles to plain tokio/dashmap types
 }
 ```
 
@@ -111,6 +123,17 @@ const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 10;   // read lock timeout
 const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 15;  // write lock timeout  
 const DEFAULT_MUTEX_WARNING_SECS: u64 = 15;         // mutex lock timeout
 ```
+
+### Sampling Configuration
+
+You can also adjust the backtrace sampling behavior by modifying these constants:
+
+```rust
+const BACKTRACE_SAMPLE_RATE: u64 = 100;              // Capture 1 in every N operations
+const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 5;   // Minimum interval between samples
+```
+
+The dual sampling approach ensures coverage through both operation-count-based sampling (every Nth operation) and time-based sampling (minimum interval), providing good diagnostic coverage while minimizing performance impact.
 
 ---
 
