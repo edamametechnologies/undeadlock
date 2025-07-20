@@ -15,7 +15,6 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tracing::{error, warn};
 
-// Bring in caller location utilities. `Location` is always available, while
 // `tracing::Instrument` is only needed when the `tokio-console` feature is
 // enabled.
 use std::panic::Location;
@@ -23,18 +22,18 @@ use std::panic::Location;
 use tracing::Instrument;
 
 // Define constants for timeouts and warning thresholds
-const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 1; // Reduced from 10s
-const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 2; // Reduced from 15s
-const DEFAULT_MUTEX_WARNING_SECS: u64 = 2; // Reduced from 15s
-const DEFAULT_DASHMAP_OP_WARNING_SECS: u64 = 1;
-const DEFAULT_DASHMAP_WRITE_LOCK_TIMEOUT_SECS: u64 = 3; // Reduced from 10s
-const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 1; // Reduced from 10ms to 1ms
+const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 10;
+const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 10;
+const DEFAULT_MUTEX_WARNING_SECS: u64 = 10;
+const DEFAULT_DASHMAP_OP_WARNING_SECS: u64 = 10;
+const DEFAULT_DASHMAP_WRITE_LOCK_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 10;
 const RW_WRITE_LOCK_KEY: &str = "__WRITE__";
 const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
 // Sampling configuration for backtrace capture
-const BACKTRACE_SAMPLE_RATE: u64 = 1000; // Reduced from 1% to 0.1% (1 in 1000)
-const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 30; // Increased from 5s to 30s
+const BACKTRACE_SAMPLE_RATE: u64 = 100;
+const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 10;
 
 // Unique counter for iterator tracking keys
 static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
