@@ -31,10 +31,6 @@ const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 10;
 const RW_WRITE_LOCK_KEY: &str = "__WRITE__";
 const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
-// Sampling configuration for backtrace capture
-const BACKTRACE_SAMPLE_RATE: u64 = 100;
-const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 10;
-
 // Unique counter for iterator tracking keys
 static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
