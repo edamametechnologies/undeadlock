@@ -1068,12 +1068,6 @@ where
         // No-op in release mode
     }
 
-    /// Returns self to mimic CustomRwLock's write() method - for API compatibility.
-    /// When CustomDashMap is wrapped in Arc, this allows code to call write() on it.
-    pub async fn write(&self) -> &Self {
-        self
-    }
-
     /// Get direct access to the underlying DashMap
     pub fn inner(&self) -> &DashMap<K, V> {
         &self.map
