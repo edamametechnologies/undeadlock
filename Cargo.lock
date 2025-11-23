@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "undeadlock"
-version = "0.9.57"
+version = "0.9.79"
 dependencies = [
  "clap",
  "criterion",
