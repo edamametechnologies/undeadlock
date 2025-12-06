@@ -2,7 +2,6 @@ use dashmap::iter::{Iter as DashIter, IterMut as DashIterMut};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::any::type_name;
-use std::backtrace::Backtrace;
 use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -124,8 +123,12 @@ impl<T> CustomRwLock<T> {
             let current_thread = std::thread::current().id();
 
             #[cfg(debug_assertions)]
+            let mut registered_waiter = false;
+
+            #[cfg(debug_assertions)]
             if self.write_locked.load(Ordering::SeqCst) {
                 self.waiters.insert(current_thread, "read".to_string());
+                registered_waiter = true;
             }
 
             #[cfg(debug_assertions)]
@@ -161,23 +164,14 @@ impl<T> CustomRwLock<T> {
                                 let (holder_thread, holder_origin) = if let Some(info) =
                                     self.write_lock_info.get(RW_WRITE_LOCK_KEY)
                                 {
-                                    let backtrace_for_analysis =
-                                        format!("{:?}", Backtrace::force_capture());
-                                    let holder_frames =
-                                        extract_useful_frames(&backtrace_for_analysis, true);
-                                    let origin = if holder_frames.is_empty() {
-                                        info.caller.clone()
-                                    } else {
-                                        let joined = holder_frames.join(" -> ");
-                                        if joined.contains("CustomRwLock")
-                                            || joined.contains("Backtrace::create")
-                                        {
-                                            info.caller.clone()
+                                    (
+                                        format!("{:?}", info.thread_id),
+                                        if info.caller.is_empty() {
+                                            "<unknown>".to_string()
                                         } else {
-                                            joined
-                                        }
-                                    };
-                                    (format!("{:?}", info.thread_id), origin)
+                                            info.caller.clone()
+                                        },
+                                    )
                                 } else {
                                     ("<none>".to_string(), "<released>".to_string())
                                 };
@@ -214,7 +208,7 @@ impl<T> CustomRwLock<T> {
 
             #[cfg(debug_assertions)]
             {
-                if self.write_locked.load(Ordering::SeqCst) {
+                if registered_waiter {
                     self.read_waiting_count.fetch_sub(1, Ordering::SeqCst);
                     self.waiters.remove(&current_thread);
                 }
@@ -264,10 +258,6 @@ impl<T> CustomRwLock<T> {
                         self.name
                     );
                 }
-
-                self.write_locked.store(true, Ordering::SeqCst);
-                self.write_lock_info
-                    .insert(RW_WRITE_LOCK_KEY.to_string(), LockInfo::new(caller.clone()));
             }
 
             // Await write lock with timeout
@@ -297,23 +287,14 @@ impl<T> CustomRwLock<T> {
                                 let (holder_thread, holder_origin) = if let Some(info) =
                                     self.write_lock_info.get(RW_WRITE_LOCK_KEY)
                                 {
-                                    let backtrace_for_analysis =
-                                        format!("{:?}", Backtrace::force_capture());
-                                    let holder_frames =
-                                        extract_useful_frames(&backtrace_for_analysis, true);
-                                    let origin = if holder_frames.is_empty() {
-                                        info.caller.clone()
-                                    } else {
-                                        let joined = holder_frames.join(" -> ");
-                                        if joined.contains("CustomRwLock")
-                                            || joined.contains("Backtrace::create")
-                                        {
-                                            info.caller.clone()
+                                    (
+                                        format!("{:?}", info.thread_id),
+                                        if info.caller.is_empty() {
+                                            "<unknown>".to_string()
                                         } else {
-                                            joined
-                                        }
-                                    };
-                                    (format!("{:?}", info.thread_id), origin)
+                                            info.caller.clone()
+                                        },
+                                    )
                                 } else {
                                     ("<none>".to_string(), "<released>".to_string())
                                 };
@@ -349,8 +330,9 @@ impl<T> CustomRwLock<T> {
 
             #[cfg(debug_assertions)]
             {
-                self.write_locked.store(false, Ordering::SeqCst);
-                self.write_lock_info.remove(RW_WRITE_LOCK_KEY);
+                self.write_locked.store(true, Ordering::SeqCst);
+                self.write_lock_info
+                    .insert(RW_WRITE_LOCK_KEY.to_string(), LockInfo::new(caller.clone()));
                 self.waiters.remove(&current_thread);
                 // Check acquisition time
                 let duration = start.elapsed();
@@ -488,10 +470,6 @@ impl<T> CustomMutex<T> {
                         self.name
                     );
                 }
-
-                self.locked.store(true, Ordering::SeqCst);
-                self.lock_info
-                    .insert(MUTEX_LOCK_KEY.to_string(), LockInfo::new(caller.clone()));
             }
 
             // Await lock with timeout
@@ -517,23 +495,14 @@ impl<T> CustomMutex<T> {
                                 // Identify current lock holder
                                 let (holder_thread, holder_origin) =
                                     if let Some(info) = self.lock_info.get(MUTEX_LOCK_KEY) {
-                                        let backtrace_for_analysis =
-                                            format!("{:?}", Backtrace::force_capture());
-                                        let holder_frames =
-                                            extract_useful_frames(&backtrace_for_analysis, true);
-                                        let origin = if holder_frames.is_empty() {
-                                            info.caller.clone()
-                                        } else {
-                                            let joined = holder_frames.join(" -> ");
-                                            if joined.contains("CustomMutex")
-                                                || joined.contains("Backtrace::create")
-                                            {
-                                                info.caller.clone()
+                                        (
+                                            format!("{:?}", info.thread_id),
+                                            if info.caller.is_empty() {
+                                                "<unknown>".to_string()
                                             } else {
-                                                joined
-                                            }
-                                        };
-                                        (format!("{:?}", info.thread_id), origin)
+                                                info.caller.clone()
+                                            },
+                                        )
                                     } else {
                                         ("<none>".to_string(), "<released>".to_string())
                                     };
@@ -569,8 +538,9 @@ impl<T> CustomMutex<T> {
 
             #[cfg(debug_assertions)]
             {
-                self.locked.store(false, Ordering::SeqCst);
-                self.lock_info.remove(MUTEX_LOCK_KEY);
+                self.locked.store(true, Ordering::SeqCst);
+                self.lock_info
+                    .insert(MUTEX_LOCK_KEY.to_string(), LockInfo::new(caller.clone()));
                 self.waiters.remove(&current_thread);
                 // Check acquisition time
                 let duration = start.elapsed();
@@ -636,88 +606,6 @@ impl<'a, T> Drop for CustomMutexGuard<'a, T> {
             self.parent.lock_info.remove(MUTEX_LOCK_KEY);
         }
     }
-}
-
-/// Utility: extract up to two relevant frames from a Debug-formatted Backtrace string
-fn extract_useful_frames(bt_str: &str, skip_undeadlock: bool) -> Vec<String> {
-    let mut frames = Vec::new();
-
-    // Debug format: Backtrace [{ fn: "fn_name", file: "path", line: 123 }, { fn: "...", ... }]
-    // Split on "}," to iterate frames
-    for seg in bt_str.split("},") {
-        // Skip if no function info
-        if let Some(fn_pos) = seg.find("fn: \"") {
-            // Extract function name
-            let fn_start = fn_pos + 5; // skip 'fn: "'
-            if let Some(fn_end_rel) = seg[fn_start..].find('\"') {
-                let fn_name = &seg[fn_start..fn_start + fn_end_rel];
-
-                // Extract file path
-                let mut file_path_opt: Option<&str> = None;
-                let mut file_name_opt: Option<&str> = None;
-                let mut line_opt: Option<&str> = None;
-
-                if let Some(file_pos) = seg.find("file: \"") {
-                    let file_start = file_pos + 7;
-                    if let Some(file_end_rel) = seg[file_start..].find('\"') {
-                        let file_path = &seg[file_start..file_start + file_end_rel];
-                        file_path_opt = Some(file_path);
-                        file_name_opt = Some(file_path.rsplit('/').next().unwrap_or(file_path));
-
-                        // Extract line number
-                        if let Some(line_pos) = seg[file_end_rel + file_start..].find("line: ") {
-                            let line_start_abs = file_start + file_end_rel + line_pos + 6;
-                            let mut line_end_abs = line_start_abs;
-                            while line_end_abs < seg.len()
-                                && seg.as_bytes()[line_end_abs].is_ascii_digit()
-                            {
-                                line_end_abs += 1;
-                            }
-                            line_opt = Some(&seg[line_start_abs..line_end_abs]);
-                        }
-                    }
-                }
-
-                // Skip system frames
-                let mut skip_frame = false;
-                if let Some(path) = file_path_opt {
-                    if path.contains("rustc")
-                        || path.contains(".cargo")
-                        || path.contains("/backtrace/")
-                        || path.contains("\\backtrace\\")
-                    {
-                        skip_frame = true;
-                    }
-                }
-                // Check undeadlock filename
-                if !skip_frame && skip_undeadlock {
-                    if let Some(file) = file_name_opt {
-                        if file == "undeadlock.rs" {
-                            skip_frame = true;
-                        }
-                    }
-                }
-
-                if skip_frame {
-                    continue;
-                }
-
-                // Format frame
-                let formatted = match (file_name_opt, line_opt) {
-                    (Some(file), Some(line)) => format!("{}() in {}:{}", fn_name, file, line),
-                    (Some(file), None) => format!("{}() in {}", fn_name, file),
-                    _ => format!("{}()", fn_name),
-                };
-
-                frames.push(formatted);
-                if frames.len() >= 2 {
-                    break;
-                }
-            }
-        }
-    }
-
-    frames
 }
 
 /// A wrapper around dashmap::mapref::one::RefMut that releases the write lock on drop.
@@ -927,27 +815,6 @@ where
         format!("{:?}", key)
     }
 
-    /// Checks if a key is currently being written to and logs if it is
-    #[cfg(debug_assertions)]
-    fn check_write_lock<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + Debug + ?Sized,
-    {
-        let key_str = self.get_key_identifier(key);
-        if let Some(ref_val) = self.write_locked_keys.get(&key_str) {
-            warn!(
-                "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?})",
-                key,
-                self.name,
-                ref_val.started_at.elapsed(),
-                ref_val.thread_id,
-            );
-            return true;
-        }
-        false
-    }
-
     /// Waits for a write lock with timeout, logs error and keeps waiting without panic.
     #[cfg(debug_assertions)]
     fn wait_for_write_lock<Q>(&self, key: &Q)
@@ -964,30 +831,30 @@ where
         let waiter_origin = "waiting_thread".to_string();
 
         let mut alerted = false;
+        let mut logged_contention = false;
         let mut spin_count = 0;
-        while self.check_write_lock(key) {
+        while let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
+            if !logged_contention {
+                warn!(
+                    "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?})",
+                    key,
+                    self.name,
+                    ref_val.started_at.elapsed(),
+                    ref_val.thread_id,
+                );
+                logged_contention = true;
+            }
             let elapsed = start.elapsed();
             if !alerted && elapsed.as_secs() > self.write_lock_timeout_secs {
                 alerted = true;
-                // include holder info if available
-                if let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
-                    error!(
-                        "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, currently held by thread {:?}",
-                        key,
-                        self.name,
-                        elapsed,
-                        waiter_origin,
-                        ref_val.thread_id,
-                    );
-                } else {
-                    error!(
-                        "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, holder info not found",
-                        key,
-                        self.name,
-                        elapsed,
-                        waiter_origin,
-                    );
-                }
+                error!(
+                    "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, currently held by thread {:?}",
+                    key,
+                    self.name,
+                    elapsed,
+                    waiter_origin,
+                    ref_val.thread_id,
+                );
             }
 
             // Spin a few times before sleeping to avoid context switches for short waits
@@ -1033,16 +900,6 @@ where
     #[cfg(debug_assertions)]
     fn release_write_lock_str(&self, key_str: &str) {
         self.write_locked_keys.remove(key_str);
-    }
-
-    // No-op versions for release mode
-    #[cfg(not(debug_assertions))]
-    fn check_write_lock<Q>(&self, _key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + Debug + ?Sized,
-    {
-        false
     }
 
     #[cfg(not(debug_assertions))]
@@ -1451,8 +1308,21 @@ where
             let key_str_wait = self.get_key_identifier(key);
             self.waiters.insert(current_thread, key_str_wait.clone());
 
+            let mut logged_contention = false;
+
             loop {
-                if !self.check_write_lock(key) {
+                if let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
+                    if !logged_contention {
+                        warn!(
+                            "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?})",
+                            key,
+                            self.name,
+                            ref_val.started_at.elapsed(),
+                            ref_val.thread_id,
+                        );
+                        logged_contention = true;
+                    }
+                } else {
                     // safe to proceed
                     self.waiters.remove(&current_thread);
                     let key_str = self.mark_write_lock(key);
