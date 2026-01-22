@@ -1,6 +1,6 @@
 [package]
 name = "undeadlock"
-version = "0.9.85"
+version = "0.9.86"
 edition = "2021"
 authors = ["EDAMAME Technologies"]
 description = "Custom synchronization primitives with deadlock detection"
