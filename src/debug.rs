@@ -30,6 +30,18 @@ const DEFAULT_LOCK_WAIT_SLEEP_MILLIS: u64 = 10;
 const RW_WRITE_LOCK_KEY: &str = "__WRITE__";
 const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
+macro_rules! undeadlock_warn {
+    ($($arg:tt)+) => {
+        warn!(target: "undeadlock", "undeadlock: {}", format_args!($($arg)+));
+    };
+}
+
+macro_rules! undeadlock_error {
+    ($($arg:tt)+) => {
+        error!(target: "undeadlock", "undeadlock: {}", format_args!($($arg)+));
+    };
+}
+
 // Unique counter for iterator tracking keys
 static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -37,6 +49,7 @@ static ITER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug)]
 struct LockInfo {
     caller: String,
+    kind: String,
     started_at: Instant,
     thread_id: ThreadId,
     timeout_logged: AtomicBool,
@@ -44,9 +57,10 @@ struct LockInfo {
 
 impl LockInfo {
     /// Creates a new LockInfo (no backtrace)
-    fn new(caller: String) -> Self {
+    fn new(caller: String, kind: &str) -> Self {
         Self {
             caller,
+            kind: kind.to_string(),
             started_at: Instant::now(),
             thread_id: std::thread::current().id(),
             timeout_logged: AtomicBool::new(false),
@@ -58,10 +72,36 @@ impl Clone for LockInfo {
     fn clone(&self) -> Self {
         Self {
             caller: self.caller.clone(),
+            kind: self.kind.clone(),
             started_at: self.started_at,
             thread_id: self.thread_id,
             timeout_logged: AtomicBool::new(self.timeout_logged.load(Ordering::SeqCst)),
         }
+    }
+}
+
+/// Information stored for each active read lock
+#[derive(Debug)]
+struct ReadLockInfo {
+    caller: String,
+    started_at: Instant,
+    thread_id: ThreadId,
+    count: usize,
+}
+
+impl ReadLockInfo {
+    fn new(caller: String) -> Self {
+        Self {
+            caller,
+            started_at: Instant::now(),
+            thread_id: std::thread::current().id(),
+            count: 1,
+        }
+    }
+
+    fn increment(&mut self, caller: String) {
+        self.count += 1;
+        self.caller = caller;
     }
 }
 
@@ -75,6 +115,8 @@ pub struct CustomRwLock<T> {
     read_waiting_count: AtomicUsize,
     #[cfg(debug_assertions)]
     write_lock_info: DashMap<String, LockInfo>,
+    #[cfg(debug_assertions)]
+    read_lock_info: DashMap<ThreadId, ReadLockInfo>,
     #[cfg(debug_assertions)]
     waiters: DashMap<ThreadId, String>,
 }
@@ -91,6 +133,8 @@ impl<T> CustomRwLock<T> {
             #[cfg(debug_assertions)]
             write_lock_info: DashMap::new(),
             #[cfg(debug_assertions)]
+            read_lock_info: DashMap::new(),
+            #[cfg(debug_assertions)]
             waiters: DashMap::new(),
         }
     }
@@ -98,7 +142,7 @@ impl<T> CustomRwLock<T> {
     #[track_caller]
     pub fn read(
         &self,
-    ) -> impl std::future::Future<Output = tokio::sync::RwLockReadGuard<'_, T>> + '_ {
+    ) -> impl std::future::Future<Output = CustomRwLockReadGuard<'_, T>> + '_ {
         // Capture the caller's location once, outside of the async block. The
         // `#[track_caller]` attribute on this sync wrapper ensures that this
         // location reflects the exterior call-site.
@@ -127,7 +171,8 @@ impl<T> CustomRwLock<T> {
 
             #[cfg(debug_assertions)]
             if self.write_locked.load(Ordering::SeqCst) {
-                self.waiters.insert(current_thread, "read".to_string());
+                self.waiters
+                    .insert(current_thread, format!("read (caller: {})", caller));
                 registered_waiter = true;
             }
 
@@ -175,18 +220,24 @@ impl<T> CustomRwLock<T> {
                                 } else {
                                     ("<none>".to_string(), "<released>".to_string())
                                 };
+                                let waiting_writers = self
+                                    .waiters
+                                    .iter()
+                                    .filter(|entry| entry.value().starts_with("write"))
+                                    .count();
 
                                 // Dump current lock state for full details
                                 self.dump_lock_state();
 
-                                error!(
-                                    "Read lock '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (continuing to wait)",
+                                undeadlock_error!(
+                                    "Read lock '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (waiting_writers: {}) (continuing to wait)",
                                     self.name,
                                     DEFAULT_RWLOCK_READ_WARNING_SECS,
                                     current_thread,
                                     caller,
                                     holder_thread,
-                                    holder_origin
+                                    holder_origin,
+                                    waiting_writers
                                 );
                             }
                         }
@@ -215,14 +266,23 @@ impl<T> CustomRwLock<T> {
                 // Check if the read lock took too long
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_RWLOCK_READ_WARNING_SECS {
-                    error!(
+                    undeadlock_error!(
                         "Read lock '{}' took too long to acquire: {:?} by thread {:?} (caller: {})",
                         self.name, duration, current_thread, caller,
                     );
                 }
+
+                self.read_lock_info
+                    .entry(current_thread)
+                    .and_modify(|info| info.increment(caller.clone()))
+                    .or_insert_with(|| ReadLockInfo::new(caller.clone()));
             }
 
-            guard
+            CustomRwLockReadGuard {
+                inner: guard,
+                parent: self,
+                thread_id: current_thread,
+            }
         }
     }
 
@@ -249,13 +309,29 @@ impl<T> CustomRwLock<T> {
 
             #[cfg(debug_assertions)]
             {
-                self.waiters.insert(current_thread, "write".to_string());
+                self.waiters
+                    .insert(current_thread, format!("write (caller: {})", caller));
                 if self.write_locked.load(Ordering::SeqCst) {
                     // Skip undeadlock.rs frames first
-
-                    warn!(
-                        "Write lock for '{}' already active when attempting to acquire another",
-                        self.name
+                    let (holder_thread, holder_origin) = if let Some(info) =
+                        self.write_lock_info.get(RW_WRITE_LOCK_KEY)
+                    {
+                        (
+                            format!("{:?}", info.thread_id),
+                            if info.caller.is_empty() {
+                                "<unknown>".to_string()
+                            } else {
+                                info.caller.clone()
+                            },
+                        )
+                    } else {
+                        ("<none>".to_string(), "<released>".to_string())
+                    };
+                    undeadlock_warn!(
+                        "Write lock for '{}' already active when attempting to acquire another (holder: {} at {})",
+                        self.name,
+                        holder_thread,
+                        holder_origin
                     );
                 }
             }
@@ -298,17 +374,19 @@ impl<T> CustomRwLock<T> {
                                 } else {
                                     ("<none>".to_string(), "<released>".to_string())
                                 };
+                                let active_readers = self.read_lock_info.len();
 
                                 self.dump_lock_state();
 
-                                error!(
-                                    "Write lock '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (continuing to wait)",
+                                undeadlock_error!(
+                                    "Write lock '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (active_readers: {}) (continuing to wait)",
                                     self.name,
                                     DEFAULT_RWLOCK_WRITE_WARNING_SECS,
                                     current_thread,
                                     caller,
                                     holder_thread,
-                                    holder_origin
+                                    holder_origin,
+                                    active_readers
                                 );
                             }
                         }
@@ -332,12 +410,12 @@ impl<T> CustomRwLock<T> {
             {
                 self.write_locked.store(true, Ordering::SeqCst);
                 self.write_lock_info
-                    .insert(RW_WRITE_LOCK_KEY.to_string(), LockInfo::new(caller.clone()));
+                    .insert(RW_WRITE_LOCK_KEY.to_string(), LockInfo::new(caller.clone(), "rw-write"));
                 self.waiters.remove(&current_thread);
                 // Check acquisition time
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_RWLOCK_WRITE_WARNING_SECS {
-                    error!(
+                    undeadlock_error!(
                         "Write lock '{}' took too long to acquire: {:?} by thread {:?} (caller: {})",
                         self.name,
                         duration,
@@ -369,18 +447,72 @@ impl<T> CustomRwLock<T> {
     pub fn dump_lock_state(&self) {
         #[cfg(debug_assertions)]
         {
-            warn!("Lock state dump for '{}':", self.name);
+            undeadlock_warn!("Lock state dump for '{}':", self.name);
+            undeadlock_warn!(
+                "Lock summary: active_readers={}, waiting_readers={}",
+                self.read_lock_info.len(),
+                self.read_waiting_count.load(Ordering::SeqCst)
+            );
             if let Some(info) = self.write_lock_info.get(RW_WRITE_LOCK_KEY) {
-                warn!(
-                    "Write lock held for {:?} by thread {:?}",
+                undeadlock_warn!(
+                    "Write lock held for {:?} by thread {:?} (kind: {}, caller: {})",
                     info.started_at.elapsed(),
                     info.thread_id,
+                    if info.kind.is_empty() { "<unknown>" } else { info.kind.as_str() },
+                    if info.caller.is_empty() {
+                        "<unknown>"
+                    } else {
+                        info.caller.as_str()
+                    }
+                );
+            }
+            for read_info in self.read_lock_info.iter() {
+                let info = read_info.value();
+                undeadlock_warn!(
+                    "Read lock held for {:?} by thread {:?} (count: {}, last_caller: {})",
+                    info.started_at.elapsed(),
+                    info.thread_id,
+                    info.count,
+                    if info.caller.is_empty() {
+                        "<unknown>"
+                    } else {
+                        info.caller.as_str()
+                    }
                 );
             }
             for waiter in self.waiters.iter() {
                 let (thread_id, kind) = waiter.pair();
-                warn!("Waiter thread {:?} waiting for {}", thread_id, kind);
+                undeadlock_warn!("Waiter thread {:?} waiting for {}", thread_id, kind);
             }
+        }
+    }
+}
+
+/// Wrapper guard that clears read-lock bookkeeping on drop
+pub struct CustomRwLockReadGuard<'a, T> {
+    inner: tokio::sync::RwLockReadGuard<'a, T>,
+    parent: &'a CustomRwLock<T>,
+    thread_id: ThreadId,
+}
+
+impl<'a, T> std::ops::Deref for CustomRwLockReadGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a, T> Drop for CustomRwLockReadGuard<'a, T> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(mut info) = self.parent.read_lock_info.get_mut(&self.thread_id) {
+                if info.count > 1 {
+                    info.count -= 1;
+                    return;
+                }
+            }
+            self.parent.read_lock_info.remove(&self.thread_id);
         }
     }
 }
@@ -463,11 +595,28 @@ impl<T> CustomMutex<T> {
 
             #[cfg(debug_assertions)]
             {
-                self.waiters.insert(current_thread, "mutex".to_string());
+                self.waiters
+                    .insert(current_thread, format!("mutex (caller: {})", caller));
                 if self.locked.load(Ordering::SeqCst) {
-                    warn!(
-                        "Mutex for '{}' already active when attempting to acquire another",
-                        self.name
+                    let (holder_thread, holder_origin) = if let Some(info) =
+                        self.lock_info.get(MUTEX_LOCK_KEY)
+                    {
+                        (
+                            format!("{:?}", info.thread_id),
+                            if info.caller.is_empty() {
+                                "<unknown>".to_string()
+                            } else {
+                                info.caller.clone()
+                            },
+                        )
+                    } else {
+                        ("<none>".to_string(), "<released>".to_string())
+                    };
+                    undeadlock_warn!(
+                        "Mutex for '{}' already active when attempting to acquire another (holder: {} at {})",
+                        self.name,
+                        holder_thread,
+                        holder_origin
                     );
                 }
             }
@@ -509,7 +658,7 @@ impl<T> CustomMutex<T> {
 
                                 self.dump_lock_state();
 
-                                error!(
+                                undeadlock_error!(
                                     "Mutex '{}' could not be acquired within {}s by thread {:?} (caller: {}) - currently held by {} at: {} (continuing to wait)",
                                     self.name,
                                     DEFAULT_MUTEX_WARNING_SECS,
@@ -540,12 +689,12 @@ impl<T> CustomMutex<T> {
             {
                 self.locked.store(true, Ordering::SeqCst);
                 self.lock_info
-                    .insert(MUTEX_LOCK_KEY.to_string(), LockInfo::new(caller.clone()));
+                    .insert(MUTEX_LOCK_KEY.to_string(), LockInfo::new(caller.clone(), "mutex"));
                 self.waiters.remove(&current_thread);
                 // Check acquisition time
                 let duration = start.elapsed();
                 if duration.as_secs() > DEFAULT_MUTEX_WARNING_SECS {
-                    error!(
+                    undeadlock_error!(
                         "Mutex '{}' took too long to acquire: {:?} by thread {:?} (caller: {})",
                         self.name, duration, current_thread, caller,
                     );
@@ -563,17 +712,23 @@ impl<T> CustomMutex<T> {
     pub fn dump_lock_state(&self) {
         #[cfg(debug_assertions)]
         {
-            warn!("Mutex state dump for '{}':", self.name);
+            undeadlock_warn!("Mutex state dump for '{}':", self.name);
             if let Some(info) = self.lock_info.get(MUTEX_LOCK_KEY) {
-                warn!(
-                    "Mutex lock held for {:?} by thread {:?}",
+                undeadlock_warn!(
+                    "Mutex lock held for {:?} by thread {:?} (kind: {}, caller: {})",
                     info.started_at.elapsed(),
                     info.thread_id,
+                    if info.kind.is_empty() { "<unknown>" } else { info.kind.as_str() },
+                    if info.caller.is_empty() {
+                        "<unknown>"
+                    } else {
+                        info.caller.as_str()
+                    }
                 );
             }
             for waiter in self.waiters.iter() {
                 let (thread_id, kind) = waiter.pair();
-                warn!("Waiter thread {:?} waiting for {}", thread_id, kind);
+                undeadlock_warn!("Waiter thread {:?} waiting for {}", thread_id, kind);
             }
         }
     }
@@ -710,9 +865,22 @@ fn register_map_for_global_monitor(
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                         {
-                            error!(
-                                "Write lock for key {} in map '{}' held after {:?} by thread {:?}",
-                                k, map_name, held, info.thread_id,
+                            undeadlock_error!(
+                                "Write lock for key {} in map '{}' held after {:?} by thread {:?} (kind: {}, caller: {})",
+                                k,
+                                map_name,
+                                held,
+                                info.thread_id,
+                                if info.kind.is_empty() {
+                                    "<unknown>"
+                                } else {
+                                    info.kind.as_str()
+                                },
+                                if info.caller.is_empty() {
+                                    "<unknown>"
+                                } else {
+                                    info.caller.as_str()
+                                }
                             );
                         }
                     }
@@ -817,7 +985,7 @@ where
 
     /// Waits for a write lock with timeout, logs error and keeps waiting without panic.
     #[cfg(debug_assertions)]
-    fn wait_for_write_lock<Q>(&self, key: &Q)
+    fn wait_for_write_lock<Q>(&self, key: &Q, caller: &str)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
@@ -825,35 +993,58 @@ where
         let start = Instant::now();
         let current_thread = std::thread::current().id();
         let key_str_wait = self.get_key_identifier(key);
-        self.waiters.insert(current_thread, key_str_wait.clone());
+        self.waiters.insert(
+            current_thread,
+            format!("{} (caller: {})", key_str_wait, caller),
+        );
 
         // Skip expensive backtrace capture during frequent contention
-        let waiter_origin = "waiting_thread".to_string();
+        let waiter_origin = caller.to_string();
 
         let mut alerted = false;
         let mut logged_contention = false;
         let mut spin_count = 0;
         while let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
             if !logged_contention {
-                warn!(
-                    "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?})",
+                undeadlock_warn!(
+                    "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?}, kind: {}, caller: {})",
                     key,
                     self.name,
                     ref_val.started_at.elapsed(),
                     ref_val.thread_id,
+                    if ref_val.kind.is_empty() {
+                        "<unknown>"
+                    } else {
+                        ref_val.kind.as_str()
+                    },
+                    if ref_val.caller.is_empty() {
+                        "<unknown>"
+                    } else {
+                        ref_val.caller.as_str()
+                    }
                 );
                 logged_contention = true;
             }
             let elapsed = start.elapsed();
             if !alerted && elapsed.as_secs() > self.write_lock_timeout_secs {
                 alerted = true;
-                error!(
-                    "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, currently held by thread {:?}",
+                undeadlock_error!(
+                    "Write lock timeout for key {:?} in map '{}' after {:?} - waiter at: {}, currently held by thread {:?} (kind: {}, caller: {})",
                     key,
                     self.name,
                     elapsed,
                     waiter_origin,
                     ref_val.thread_id,
+                    if ref_val.kind.is_empty() {
+                        "<unknown>"
+                    } else {
+                        ref_val.kind.as_str()
+                    },
+                    if ref_val.caller.is_empty() {
+                        "<unknown>"
+                    } else {
+                        ref_val.caller.as_str()
+                    }
                 );
             }
 
@@ -875,7 +1066,7 @@ where
 
     /// Marks a key as being written to
     #[cfg(debug_assertions)]
-    fn mark_write_lock<Q>(&self, key: &Q) -> String
+    fn mark_write_lock<Q>(&self, key: &Q, caller: &str, kind: &str) -> String
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
@@ -888,7 +1079,7 @@ where
                 // someone else already tracking – no need to spawn another checker
             }
             dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(LockInfo::new(String::new()));
+                v.insert(LockInfo::new(caller.to_string(), kind));
 
                 // per-lock checker removed; global monitor thread handles timeouts
             }
@@ -903,7 +1094,7 @@ where
     }
 
     #[cfg(not(debug_assertions))]
-    fn wait_for_write_lock<Q>(&self, _key: &Q)
+    fn wait_for_write_lock<Q>(&self, _key: &Q, _caller: &str)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
@@ -912,7 +1103,7 @@ where
     }
 
     #[cfg(not(debug_assertions))]
-    fn mark_write_lock<Q>(&self, _key: &Q) -> String
+    fn mark_write_lock<Q>(&self, _key: &Q, _caller: &str, _kind: &str) -> String
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
@@ -931,11 +1122,14 @@ where
     }
 
     /// Instrumented get; logs if the operation takes longer than 1ms.
+    #[track_caller]
     pub fn get<Q>(&self, key: &Q) -> Option<CustomRef<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
     {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start = Instant::now();
 
@@ -945,7 +1139,7 @@ where
         {
             let elapsed = start.elapsed();
             if elapsed.as_secs() > 1 {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' get took {:?} (>1s) for key: {:?}",
                     self.name, elapsed, key
                 );
@@ -955,7 +1149,7 @@ where
                 let key_str = self.get_key_identifier(key);
                 // register read lock
                 self.write_locked_keys
-                    .insert(key_str.clone(), LockInfo::new(String::new()));
+                    .insert(key_str.clone(), LockInfo::new(caller.clone(), "dashmap-read"));
                 CustomRef {
                     inner: r,
                     map: self,
@@ -975,15 +1169,18 @@ where
     }
 
     /// Instrumented insert; logs if the operation takes longer than the warning threshold.
+    #[track_caller]
     pub fn insert(&self, key: K, value: V) {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start = Instant::now();
 
         #[cfg(debug_assertions)]
-        self.wait_for_write_lock(&key);
+        self.wait_for_write_lock(&key, &caller);
 
         #[cfg(debug_assertions)]
-        let key_str = self.mark_write_lock(&key);
+        let key_str = self.mark_write_lock(&key, &caller, "dashmap-write");
 
         self.map.insert(key, value);
 
@@ -992,7 +1189,7 @@ where
             let elapsed = start.elapsed();
             self.release_write_lock_str(&key_str);
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' insert took {:?} (>{} sec)",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
@@ -1001,19 +1198,22 @@ where
     }
 
     /// Instrumented remove; logs if the operation takes longer than the warning threshold.
+    #[track_caller]
     pub fn remove<Q>(&self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
     {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start = Instant::now();
 
         #[cfg(debug_assertions)]
-        self.wait_for_write_lock(key);
+        self.wait_for_write_lock(key, &caller);
 
         #[cfg(debug_assertions)]
-        let key_str = self.mark_write_lock(key);
+        let key_str = self.mark_write_lock(key, &caller, "dashmap-write");
 
         let res = self.map.remove(key);
 
@@ -1022,7 +1222,7 @@ where
             let elapsed = start.elapsed();
             self.release_write_lock_str(&key_str);
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' remove took {:?} (>{} sec) for key: {:?}",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS, key
                 );
@@ -1033,7 +1233,10 @@ where
     }
 
     /// Clears all entries; logs if the operation takes longer than the warning threshold.
+    #[track_caller]
     pub fn clear(&self) {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start = Instant::now();
 
@@ -1042,7 +1245,7 @@ where
             // For clear, we lock the entire map
             self.write_locked_keys.insert(
                 "__CLEAR_OPERATION__".to_string(),
-                LockInfo::new(String::new()),
+                LockInfo::new(caller, "dashmap-clear"),
             );
         }
 
@@ -1053,7 +1256,7 @@ where
             self.write_locked_keys.clear(); // Clear all locks including our own
             let elapsed = start.elapsed();
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' clear took {:?} (>{} sec)",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
@@ -1081,7 +1284,10 @@ where
     }
 
     /// Returns an iterator over the entries of the map.
+    #[track_caller]
     pub fn iter(&self) -> TimedIter<DashIter<'_, K, V>> {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start_acquire = Instant::now();
 
@@ -1091,7 +1297,7 @@ where
         {
             let elapsed = start_acquire.elapsed();
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' iter acquisition took {:?} (>{} sec)",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
@@ -1100,7 +1306,7 @@ where
             let iter_id = ITER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let key = format!("__ITER__{}", iter_id);
             self.write_locked_keys
-                .insert(key.clone(), LockInfo::new(String::new()));
+                .insert(key.clone(), LockInfo::new(caller, "dashmap-iter"));
 
             TimedIter {
                 inner: it,
@@ -1124,7 +1330,10 @@ where
     }
 
     /// Returns a mutable iterator over the entries of the map.
+    #[track_caller]
     pub fn iter_mut(&self) -> TimedIter<DashIterMut<'_, K, V>> {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start_acquire = Instant::now();
 
@@ -1134,7 +1343,7 @@ where
         {
             let elapsed = start_acquire.elapsed();
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' iter_mut acquisition took {:?} (>{} sec)",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
@@ -1142,7 +1351,7 @@ where
             let iter_id = ITER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let key = format!("__ITER__{}", iter_id);
             self.write_locked_keys
-                .insert(key.clone(), LockInfo::new(String::new()));
+                .insert(key.clone(), LockInfo::new(caller, "dashmap-iter-mut"));
 
             TimedIter {
                 inner: it,
@@ -1167,19 +1376,22 @@ where
 
     /// Instrumented get_mut; logs if the operation takes longer than the warning threshold.
     /// Returns a custom RefMut wrapper that releases the lock on Drop.
+    #[track_caller]
     pub fn get_mut<Q>(&self, key: &Q) -> Option<CustomRefMut<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
     {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start = Instant::now();
 
         #[cfg(debug_assertions)]
-        self.wait_for_write_lock(key);
+        self.wait_for_write_lock(key, &caller);
 
         #[cfg(debug_assertions)]
-        let key_str = self.mark_write_lock(key);
+        let key_str = self.mark_write_lock(key, &caller, "dashmap-write");
 
         let res = self.map.get_mut(key);
 
@@ -1193,7 +1405,7 @@ where
             }
 
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' get_mut took {:?} (>{} sec) for key: {:?}",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS, key
                 );
@@ -1218,12 +1430,15 @@ where
     }
 
     /// Returns a reference to the entry for the given key in the map for in-place manipulation.
+    #[track_caller]
     pub fn entry(&self, key: K) -> dashmap::mapref::entry::Entry<'_, K, V> {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         {
             // Fail-fast path identical to get_mut():
-            self.wait_for_write_lock(&key); // will log + wait on timeout
-            let key_str = self.mark_write_lock(&key);
+            self.wait_for_write_lock(&key, &caller); // will log + wait on timeout
+            let key_str = self.mark_write_lock(&key, &caller, "dashmap-entry");
             let e = self.map.entry(key);
             // We have no way of knowing when the caller is finished with the Entry,
             // so release immediately; this only protects against *double* writers
@@ -1239,7 +1454,10 @@ where
     }
 
     /// Retains only the elements specified by the predicate.
+    #[track_caller]
     pub fn retain(&self, f: impl FnMut(&K, &mut V) -> bool) {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start = Instant::now();
 
@@ -1248,7 +1466,7 @@ where
             // For retain, we lock the entire map since it can modify any key
             self.write_locked_keys.insert(
                 "__RETAIN_OPERATION__".to_string(),
-                LockInfo::new(String::new()),
+                LockInfo::new(caller, "dashmap-retain"),
             );
         }
 
@@ -1259,7 +1477,7 @@ where
             self.write_locked_keys.remove("__RETAIN_OPERATION__");
             let elapsed = start.elapsed();
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' retain took {:?} (>{} sec)",
                     self.name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
@@ -1271,27 +1489,38 @@ where
     pub fn dump_lock_state(&self) {
         #[cfg(debug_assertions)]
         {
-            warn!("Lock state dump for map '{}':", self.name);
+            undeadlock_warn!("Lock state dump for map '{}':", self.name);
 
             let now = Instant::now();
             for item in self.write_locked_keys.iter() {
                 let (k, info) = item.pair();
-                warn!(
-                    "Lock held: key={}, duration={:?}, thread={:?}",
+                undeadlock_warn!(
+                    "Lock held: key={}, duration={:?}, thread={:?}, kind={}, caller={}",
                     k,
                     now.duration_since(info.started_at),
                     info.thread_id,
+                    if info.kind.is_empty() {
+                        "<unknown>"
+                    } else {
+                        info.kind.as_str()
+                    },
+                    if info.caller.is_empty() {
+                        "<unknown>"
+                    } else {
+                        info.caller.as_str()
+                    }
                 );
             }
 
             for waiter in self.waiters.iter() {
                 let (thread_id, k) = waiter.pair();
-                warn!("Waiter: thread={:?}, waiting_for={}", thread_id, k);
+                undeadlock_warn!("Waiter: thread={:?}, waiting_for={}", thread_id, k);
             }
         }
     }
 
     /// Similar to get_mut but lets the caller specify a custom timeout.
+    #[track_caller]
     pub fn get_mut_with_timeout<Q>(
         &self,
         key: &Q,
@@ -1301,31 +1530,44 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + Debug + ?Sized,
     {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         {
             let deadline = Instant::now() + timeout;
             let current_thread = std::thread::current().id();
             let key_str_wait = self.get_key_identifier(key);
-            self.waiters.insert(current_thread, key_str_wait.clone());
+            self.waiters
+                .insert(current_thread, format!("{} (caller: {})", key_str_wait, caller));
 
             let mut logged_contention = false;
 
             loop {
                 if let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
                     if !logged_contention {
-                        warn!(
-                            "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?})",
+                        undeadlock_warn!(
+                            "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?}, kind: {}, caller: {})",
                             key,
                             self.name,
                             ref_val.started_at.elapsed(),
                             ref_val.thread_id,
+                            if ref_val.kind.is_empty() {
+                                "<unknown>"
+                            } else {
+                                ref_val.kind.as_str()
+                            },
+                            if ref_val.caller.is_empty() {
+                                "<unknown>"
+                            } else {
+                                ref_val.caller.as_str()
+                            }
                         );
                         logged_contention = true;
                     }
                 } else {
                     // safe to proceed
                     self.waiters.remove(&current_thread);
-                    let key_str = self.mark_write_lock(key);
+                    let key_str = self.mark_write_lock(key, &caller, "dashmap-write");
                     let res = self.map.get_mut(key);
                     // If we failed to get the ref, release immediately
                     if res.is_none() {
@@ -1367,10 +1609,13 @@ where
     /// Removes all key-value pairs from the map and returns them as an iterator.
     /// The map will be empty after this call.
     /// This operation acquires a conceptual write lock on the entire map for its duration.
+    #[track_caller]
     pub fn drain(&self) -> TimedIter<std::vec::IntoIter<(K, V)>>
     where
         V: Clone, // K is already Clone from the impl block
     {
+        let caller_location = Location::caller();
+        let caller = format!("{}:{}", caller_location.file(), caller_location.line());
         #[cfg(debug_assertions)]
         let start_overall = Instant::now(); // For overall operation timing
 
@@ -1379,7 +1624,7 @@ where
             // For drain, we acquire a conceptual lock on the entire map
             self.write_locked_keys.insert(
                 "__DRAIN_OPERATION__".to_string(),
-                LockInfo::new(String::new()),
+                LockInfo::new(caller, "dashmap-drain"),
             );
         }
 
@@ -1400,7 +1645,7 @@ where
         {
             let elapsed_overall = start_overall.elapsed();
             if elapsed_overall.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' drain operation (collection + clear) took {:?} (>{} sec)",
                     self.name, elapsed_overall, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
@@ -1493,7 +1738,7 @@ impl<I> Drop for TimedIter<I> {
 
             let elapsed = self.start.elapsed();
             if elapsed.as_secs() > DEFAULT_DASHMAP_OP_WARNING_SECS {
-                error!(
+                undeadlock_error!(
                     "CustomDashMap '{}' iterator lived {:?} (>{} sec)",
                     self.map_name, elapsed, DEFAULT_DASHMAP_OP_WARNING_SECS
                 );
