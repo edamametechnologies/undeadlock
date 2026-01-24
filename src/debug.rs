@@ -240,15 +240,14 @@ impl<T> CustomRwLock<T> {
 
             #[cfg(debug_assertions)]
             if self.write_locked.load(Ordering::SeqCst) {
-                self.waiters
-                    .insert(
-                        current_thread,
-                        format!(
-                            "read (caller: {}, context: {})",
-                            caller,
-                            context_label(&context)
-                        ),
-                    );
+                self.waiters.insert(
+                    current_thread,
+                    format!(
+                        "read (caller: {}, context: {})",
+                        caller,
+                        context_label(&context)
+                    ),
+                );
                 registered_waiter = true;
             }
 
@@ -283,29 +282,28 @@ impl<T> CustomRwLock<T> {
                             Err(_) => {
                                 // Determine who currently holds the write lock (if any)
                                 let (holder_thread, holder_origin, holder_context) =
-                                    if let Some(info) =
-                                    self.write_lock_info.get(RW_WRITE_LOCK_KEY)
-                                {
-                                    (
-                                        format!("{:?}", info.thread_id),
-                                        if info.caller.is_empty() {
-                                            "<unknown>".to_string()
-                                        } else {
-                                            info.caller.clone()
-                                        },
-                                        if info.context.is_empty() {
-                                            "<none>".to_string()
-                                        } else {
-                                            info.context.clone()
-                                        },
-                                    )
-                                } else {
-                                    (
-                                        "<none>".to_string(),
-                                        "<released>".to_string(),
-                                        "<none>".to_string(),
-                                    )
-                                };
+                                    if let Some(info) = self.write_lock_info.get(RW_WRITE_LOCK_KEY)
+                                    {
+                                        (
+                                            format!("{:?}", info.thread_id),
+                                            if info.caller.is_empty() {
+                                                "<unknown>".to_string()
+                                            } else {
+                                                info.caller.clone()
+                                            },
+                                            if info.context.is_empty() {
+                                                "<none>".to_string()
+                                            } else {
+                                                info.context.clone()
+                                            },
+                                        )
+                                    } else {
+                                        (
+                                            "<none>".to_string(),
+                                            "<released>".to_string(),
+                                            "<none>".to_string(),
+                                        )
+                                    };
                                 let waiting_writers = self
                                     .waiters
                                     .iter()
@@ -367,7 +365,9 @@ impl<T> CustomRwLock<T> {
                 self.read_lock_info
                     .entry(current_thread)
                     .and_modify(|info| info.increment(caller.clone(), context.clone()))
-                    .or_insert_with(|| ReadLockInfo::new(caller.clone(), context.clone(), duration));
+                    .or_insert_with(|| {
+                        ReadLockInfo::new(caller.clone(), context.clone(), duration)
+                    });
             }
 
             CustomRwLockReadGuard {
@@ -402,15 +402,14 @@ impl<T> CustomRwLock<T> {
 
             #[cfg(debug_assertions)]
             {
-                self.waiters
-                    .insert(
-                        current_thread,
-                        format!(
-                            "write (caller: {}, context: {})",
-                            caller,
-                            context_label(&context)
-                        ),
-                    );
+                self.waiters.insert(
+                    current_thread,
+                    format!(
+                        "write (caller: {}, context: {})",
+                        caller,
+                        context_label(&context)
+                    ),
+                );
                 if self.write_locked.load(Ordering::SeqCst) {
                     // Skip undeadlock.rs frames first
                     let (holder_thread, holder_origin, holder_context) =
@@ -471,29 +470,28 @@ impl<T> CustomRwLock<T> {
                             Err(_) => {
                                 // Identify current write holder (should be same, but safe)
                                 let (holder_thread, holder_origin, holder_context) =
-                                    if let Some(info) =
-                                    self.write_lock_info.get(RW_WRITE_LOCK_KEY)
-                                {
-                                    (
-                                        format!("{:?}", info.thread_id),
-                                        if info.caller.is_empty() {
-                                            "<unknown>".to_string()
-                                        } else {
-                                            info.caller.clone()
-                                        },
-                                        if info.context.is_empty() {
-                                            "<none>".to_string()
-                                        } else {
-                                            info.context.clone()
-                                        },
-                                    )
-                                } else {
-                                    (
-                                        "<none>".to_string(),
-                                        "<released>".to_string(),
-                                        "<none>".to_string(),
-                                    )
-                                };
+                                    if let Some(info) = self.write_lock_info.get(RW_WRITE_LOCK_KEY)
+                                    {
+                                        (
+                                            format!("{:?}", info.thread_id),
+                                            if info.caller.is_empty() {
+                                                "<unknown>".to_string()
+                                            } else {
+                                                info.caller.clone()
+                                            },
+                                            if info.context.is_empty() {
+                                                "<none>".to_string()
+                                            } else {
+                                                info.context.clone()
+                                            },
+                                        )
+                                    } else {
+                                        (
+                                            "<none>".to_string(),
+                                            "<released>".to_string(),
+                                            "<none>".to_string(),
+                                        )
+                                    };
                                 let active_readers = self.read_lock_info.len();
 
                                 self.dump_lock_state();
@@ -729,15 +727,14 @@ impl<T> CustomMutex<T> {
 
             #[cfg(debug_assertions)]
             {
-                self.waiters
-                    .insert(
-                        current_thread,
-                        format!(
-                            "mutex (caller: {}, context: {})",
-                            caller,
-                            context_label(&context)
-                        ),
-                    );
+                self.waiters.insert(
+                    current_thread,
+                    format!(
+                        "mutex (caller: {}, context: {})",
+                        caller,
+                        context_label(&context)
+                    ),
+                );
                 if self.locked.load(Ordering::SeqCst) {
                     let (holder_thread, holder_origin, holder_context) =
                         if let Some(info) = self.lock_info.get(MUTEX_LOCK_KEY) {
@@ -1272,12 +1269,7 @@ where
                 // someone else already tracking – no need to spawn another checker
             }
             dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(LockInfo::new(
-                    caller.to_string(),
-                    kind,
-                    waited_for,
-                    context,
-                ));
+                v.insert(LockInfo::new(caller.to_string(), kind, waited_for, context));
 
                 // per-lock checker removed; global monitor thread handles timeouts
             }
@@ -1361,7 +1353,12 @@ where
                 // register read lock
                 self.write_locked_keys.insert(
                     key_str.clone(),
-                    LockInfo::new(caller.clone(), "dashmap-read", Duration::from_secs(0), context),
+                    LockInfo::new(
+                        caller.clone(),
+                        "dashmap-read",
+                        Duration::from_secs(0),
+                        context,
+                    ),
                 );
                 CustomRef {
                     inner: r,
@@ -1397,8 +1394,13 @@ where
         let op_start = Instant::now();
 
         #[cfg(debug_assertions)]
-        let key_str =
-            self.mark_write_lock(&key, &caller, "dashmap-write", wait_duration, context.clone());
+        let key_str = self.mark_write_lock(
+            &key,
+            &caller,
+            "dashmap-write",
+            wait_duration,
+            context.clone(),
+        );
 
         self.map.insert(key, value);
 
@@ -1442,8 +1444,13 @@ where
         let op_start = Instant::now();
 
         #[cfg(debug_assertions)]
-        let key_str =
-            self.mark_write_lock(key, &caller, "dashmap-write", wait_duration, context.clone());
+        let key_str = self.mark_write_lock(
+            key,
+            &caller,
+            "dashmap-write",
+            wait_duration,
+            context.clone(),
+        );
 
         let res = self.map.remove(key);
 
@@ -1484,7 +1491,12 @@ where
             // For clear, we lock the entire map
             self.write_locked_keys.insert(
                 "__CLEAR_OPERATION__".to_string(),
-                LockInfo::new(caller, "dashmap-clear", Duration::from_secs(0), context.clone()),
+                LockInfo::new(
+                    caller,
+                    "dashmap-clear",
+                    Duration::from_secs(0),
+                    context.clone(),
+                ),
             );
         }
 
@@ -1551,11 +1563,10 @@ where
             // Register iterator in write_locked_keys so the global monitor can track it
             let iter_id = ITER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let key = format!("__ITER__{}", iter_id);
-            self.write_locked_keys
-                .insert(
-                    key.clone(),
-                    LockInfo::new(caller, "dashmap-iter", elapsed, context.clone()),
-                );
+            self.write_locked_keys.insert(
+                key.clone(),
+                LockInfo::new(caller, "dashmap-iter", elapsed, context.clone()),
+            );
 
             TimedIter {
                 inner: it,
@@ -1603,11 +1614,10 @@ where
             }
             let iter_id = ITER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let key = format!("__ITER__{}", iter_id);
-            self.write_locked_keys
-                .insert(
-                    key.clone(),
-                    LockInfo::new(caller, "dashmap-iter-mut", elapsed, context.clone()),
-                );
+            self.write_locked_keys.insert(
+                key.clone(),
+                LockInfo::new(caller, "dashmap-iter-mut", elapsed, context.clone()),
+            );
 
             TimedIter {
                 inner: it,
@@ -1648,8 +1658,13 @@ where
         let wait_duration = self.wait_for_write_lock(key, &caller, &context);
 
         #[cfg(debug_assertions)]
-        let key_str =
-            self.mark_write_lock(key, &caller, "dashmap-write", wait_duration, context.clone());
+        let key_str = self.mark_write_lock(
+            key,
+            &caller,
+            "dashmap-write",
+            wait_duration,
+            context.clone(),
+        );
 
         let res = self.map.get_mut(key);
 
@@ -1733,7 +1748,12 @@ where
             // For retain, we lock the entire map since it can modify any key
             self.write_locked_keys.insert(
                 "__RETAIN_OPERATION__".to_string(),
-                LockInfo::new(caller, "dashmap-retain", Duration::from_secs(0), context.clone()),
+                LockInfo::new(
+                    caller,
+                    "dashmap-retain",
+                    Duration::from_secs(0),
+                    context.clone(),
+                ),
             );
         }
 
@@ -1914,7 +1934,12 @@ where
             // For drain, we acquire a conceptual lock on the entire map
             self.write_locked_keys.insert(
                 "__DRAIN_OPERATION__".to_string(),
-                LockInfo::new(caller, "dashmap-drain", Duration::from_secs(0), context.clone()),
+                LockInfo::new(
+                    caller,
+                    "dashmap-drain",
+                    Duration::from_secs(0),
+                    context.clone(),
+                ),
             );
         }
 
