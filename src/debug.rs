@@ -32,13 +32,31 @@ const MUTEX_LOCK_KEY: &str = "__MUTEX__";
 
 macro_rules! undeadlock_warn {
     ($($arg:tt)+) => {
-        warn!(target: "undeadlock", "undeadlock: {}", format_args!($($arg)+));
+        {
+            let msg = format!($($arg)+);
+            for (i, line) in msg.lines().enumerate() {
+                if i == 0 {
+                    warn!(target: "undeadlock", "{}", line);
+                } else {
+                    warn!(target: "undeadlock", "undeadlock: {}", line);
+                }
+            }
+        }
     };
 }
 
 macro_rules! undeadlock_error {
     ($($arg:tt)+) => {
-        error!(target: "undeadlock", "undeadlock: {}", format_args!($($arg)+));
+        {
+            let msg = format!($($arg)+);
+            for (i, line) in msg.lines().enumerate() {
+                if i == 0 {
+                    error!(target: "undeadlock", "{}", line);
+                } else {
+                    error!(target: "undeadlock", "undeadlock: {}", line);
+                }
+            }
+        }
     };
 }
 
