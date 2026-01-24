@@ -3,6 +3,21 @@ use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use tokio::sync::{Mutex, RwLock};
 
+#[derive(Default)]
+pub struct LockContextGuard {
+    _private: (),
+}
+
+impl Drop for LockContextGuard {
+    fn drop(&mut self) {}
+}
+
+pub fn set_lock_context(_context: impl Into<String>) -> LockContextGuard {
+    LockContextGuard { _private: () }
+}
+
+pub fn clear_lock_context() {}
+
 /// In release builds we skip the heavy debugging wrappers and simply
 /// re-export the standard Tokio `RwLock`.
 /// All APIs (`new`, `read`, `write`, etc.) are therefore identical and zero-cost.
