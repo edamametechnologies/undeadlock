@@ -1,0 +1,60 @@
+---
+description: "Undeadlock - Diagnostic sync primitives with deadlock detection"
+alwaysApply: true
+---
+
+# Undeadlock - Deadlock Detection Library
+
+> **Master Repository:** `edamame_app` - See `../edamame_app/.cursor/rules/workspace.mdc` for workspace-wide rules.
+
+## Project Overview
+
+Light-weight diagnostic wrappers around `tokio::sync::RwLock`, `tokio::sync::Mutex`, and `dashmap::DashMap` that help discover lock contention and potential deadlocks during development.
+
+In **debug** builds: Gathers runtime diagnostics (backtraces, timestamps, thread-ids) and logs warnings when locks are held too long.
+
+In **release** builds: Zero overhead - types collapse to plain tokio/dashmap primitives.
+
+## Key Types
+- `CustomRwLock<T>` - Wrapper around `tokio::sync::RwLock`
+- `CustomMutex<T>` - Wrapper around `tokio::sync::Mutex`
+- `CustomDashMap<K, V>` - Wrapper around `dashmap::DashMap`
+
+## Source Files
+- `src/lib.rs` - Re-exports based on build mode
+- `src/debug.rs` - Debug build implementation with diagnostics
+- `src/release.rs` - Release build pass-through implementation
+
+## Build & Test
+```bash
+cargo build                                    # Debug with diagnostics
+cargo build --release                          # Release (zero overhead)
+cargo test
+cargo run --example basic_rwlock --features examples
+```
+
+## Default Thresholds (debug builds)
+- Read lock warning: 10 seconds
+- Write lock warning: 15 seconds
+- Mutex lock warning: 15 seconds
+- DashMap key held warning: 10 seconds
+
+## Sampling Configuration
+- Write operations: ~1% backtrace sampling (1 in 100)
+- Read operations: No backtraces (performance)
+- Timeouts: Always capture full diagnostics
+
+## Usage
+```rust
+use undeadlock::{CustomRwLock, CustomMutex, CustomDashMap};
+
+let lock = CustomRwLock::new(0u64);
+let map = CustomDashMap::new("my_map");
+```
+
+## Local Development
+Toggle local/git dependencies (run from edamame_app):
+```bash
+cd ../edamame_app && ./flip.sh local
+cd ../edamame_app && ./flip.sh git
+```
