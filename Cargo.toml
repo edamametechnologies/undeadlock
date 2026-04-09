@@ -1,6 +1,6 @@
 [package]
 name = "undeadlock"
-version = "1.0.2"
+version = "1.2.0"
 edition = "2021"
 authors = ["EDAMAME Technologies"]
 description = "Custom synchronization primitives with deadlock detection"
@@ -18,13 +18,8 @@ tokio-console = []
 examples = ["clap", "tracing-subscriber"]
 
 [dependencies]
-# Core dependencies
-once_cell = "1.19.0"
-
-# Async
 tokio = { version = "1.39.2", features = ["sync", "macros", "time"] }
 dashmap = "6.0.1"
-futures = "0.3.31"
 
 # Logging
 tracing = "0.1.40"

@@ -1,4 +1,4 @@
-/// Conditional dispatch to debug or release implementations of `CustomRwLock` and `CustomDashMap`.
+//! Conditional dispatch to debug or release implementations of `CustomRwLock` and `CustomDashMap`.
 
 #[cfg(debug_assertions)]
 mod debug;

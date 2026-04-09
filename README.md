@@ -5,8 +5,8 @@ Light-weight diagnostic wrappers around `tokio::sync::RwLock`, `tokio::sync::Mut
 In **debug** builds the wrappers gather rich runtime information (back-traces via sampling, timestamps, thread-ids, locked keys, …) and emit `tracing` warnings or errors whenever:
 
 * acquiring a read lock takes longer than **10 s**;
-* acquiring a write lock takes longer than **15 s**;
-* acquiring a mutex lock takes longer than **15 s**;
+* acquiring a write lock takes longer than **10 s**;
+* acquiring a mutex lock takes longer than **10 s**;
 * a `CustomDashMap` key is still held after **10 s** by another writer;
 * an instrumented map/lock operation itself runs for more than **1 s**.
 
@@ -120,20 +120,9 @@ For `CustomRwLock` and `CustomMutex` thresholds, modify the constants in `src/de
 
 ```rust
 const DEFAULT_RWLOCK_READ_WARNING_SECS: u64 = 10;   // read lock timeout
-const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 15;  // write lock timeout  
-const DEFAULT_MUTEX_WARNING_SECS: u64 = 15;         // mutex lock timeout
+const DEFAULT_RWLOCK_WRITE_WARNING_SECS: u64 = 10;  // write lock timeout  
+const DEFAULT_MUTEX_WARNING_SECS: u64 = 10;         // mutex lock timeout
 ```
-
-### Sampling Configuration
-
-You can also adjust the backtrace sampling behavior by modifying these constants:
-
-```rust
-const BACKTRACE_SAMPLE_RATE: u64 = 100;              // Capture 1 in every N operations
-const BACKTRACE_SAMPLE_MIN_INTERVAL_SECS: u64 = 5;   // Minimum interval between samples
-```
-
-The dual sampling approach ensures coverage through both operation-count-based sampling (every Nth operation) and time-based sampling (minimum interval), providing good diagnostic coverage while minimizing performance impact.
 
 ---
 
