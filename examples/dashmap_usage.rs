@@ -217,16 +217,14 @@ fn main() {
         let map2 = Arc::clone(&async_map);
 
         let task1 = tokio::spawn(async move {
-            // Get write access
-            let _guard = map1.write().await;
+            // CustomDashMap is lock-free (DashMap underneath); inserts do not
+            // need an external write guard.
             map1.insert("task1", 100);
             println!("  Task 1 inserted value");
         });
 
         let task2 = tokio::spawn(async move {
-            // Wait a bit then insert
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _guard = map2.write().await;
             map2.insert("task2", 200);
             println!("  Task 2 inserted value");
         });
