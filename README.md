@@ -41,7 +41,7 @@ Add the crate and (optionally) enable the `tokio-console` feature to propagate c
 
 ```toml
 [dependencies]
-undeadlock = { version = "0.1", features = ["tokio-console"] }
+undeadlock = { version = "1.2", features = ["tokio-console"] }
 ```
 
 Replace your existing locks:
