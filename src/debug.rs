@@ -1073,25 +1073,39 @@ where
         let mut alerted = false;
         let mut logged_contention = false;
         let mut spin_count = 0;
-        while let Some(ref_val) = self.write_locked_keys.get(&key_str_wait) {
+        // Clone LockInfo out and drop the DashMap Ref BEFORE spinning/sleeping.
+        // Holding `write_locked_keys.get()` across sleep deadlocks the holder:
+        // their `release_write_lock_str`/`remove` needs exclusive shard access
+        // while waiters keep a shared Ref alive. This is the debug-only hang
+        // that wedged concurrent ECONOMICS_REPORT_CACHE / transcript_collect
+        // inserts (e.g. Augmentation tab "Loading augmentation report...").
+        loop {
+            let Some(info) = self
+                .write_locked_keys
+                .get(&key_str_wait)
+                .map(|ref_val| ref_val.clone())
+            else {
+                break;
+            };
+
             if !logged_contention {
                 undeadlock_warn!(
                     "Write lock contention for key {:?} in map '{}' (held for {:?} by thread {:?}, kind: {}, caller: {}, context: {})",
                     key,
                     self.name,
-                    ref_val.started_at.elapsed(),
-                    ref_val.thread_id,
-                    if ref_val.kind.is_empty() {
+                    info.started_at.elapsed(),
+                    info.thread_id,
+                    if info.kind.is_empty() {
                         "<unknown>"
                     } else {
-                        ref_val.kind.as_str()
+                        info.kind.as_str()
                     },
-                    if ref_val.caller.is_empty() {
+                    if info.caller.is_empty() {
                         "<unknown>"
                     } else {
-                        ref_val.caller.as_str()
+                        info.caller.as_str()
                     },
-                    context_label(&ref_val.context)
+                    context_label(&info.context)
                 );
                 logged_contention = true;
             }
@@ -1105,18 +1119,18 @@ where
                     elapsed,
                     waiter_origin,
                     context_label(&waiter_context),
-                    ref_val.thread_id,
-                    if ref_val.kind.is_empty() {
+                    info.thread_id,
+                    if info.kind.is_empty() {
                         "<unknown>"
                     } else {
-                        ref_val.kind.as_str()
+                        info.kind.as_str()
                     },
-                    if ref_val.caller.is_empty() {
+                    if info.caller.is_empty() {
                         "<unknown>"
                     } else {
-                        ref_val.caller.as_str()
+                        info.caller.as_str()
                     },
-                    context_label(&ref_val.context)
+                    context_label(&info.context)
                 );
             }
 
@@ -1863,5 +1877,54 @@ where
     #[inline]
     pub fn pair(&self) -> (&K, &V) {
         self.inner.pair()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Regression: a concurrent `get` (which marks `write_locked_keys`) plus
+    /// `insert` (which waits on that mark) must not deadlock. The old
+    /// `wait_for_write_lock` held the tracking-map DashMap Ref across sleep,
+    /// so the `get` holder could never `remove` its mark.
+    #[test]
+    fn insert_does_not_deadlock_against_held_get() {
+        let map = Arc::new(CustomDashMap::new("deadlock_regression"));
+        map.insert("k".to_string(), 1u32);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let map_reader = Arc::clone(&map);
+        let barrier_reader = Arc::clone(&barrier);
+        let reader = thread::spawn(move || {
+            let guard = map_reader.get("k").expect("key present");
+            barrier_reader.wait();
+            // Hold the read mark long enough for the inserter to enter the
+            // wait loop (and, under the old code, sleep while holding the
+            // tracking Ref).
+            thread::sleep(Duration::from_millis(200));
+            drop(guard);
+        });
+
+        let map_writer = Arc::clone(&map);
+        let barrier_writer = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            barrier_writer.wait();
+            map_writer.insert("k".to_string(), 2u32);
+        });
+
+        reader.join().expect("reader thread panicked");
+        // A hung writer is the failure mode we are guarding against.
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = writer.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("insert deadlocked against held get() Ref");
+        assert_eq!(map.get("k").map(|v| *v), Some(2));
     }
 }
