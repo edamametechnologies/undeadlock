@@ -14,6 +14,9 @@ async_fn_in_trait = "allow"
 
 [features]
 default = []
+# Opt-in instrumentation in release/profile builds (otherwise debug_assertions only).
+# Downstream crates expose this as `lock-diagnostics`.
+diagnostics = []
 tokio-console = []
 examples = ["clap", "tracing-subscriber"]
 

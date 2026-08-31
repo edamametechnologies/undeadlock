@@ -1,13 +1,15 @@
-//! Conditional dispatch to debug or release implementations of `CustomRwLock` and `CustomDashMap`.
+//! Conditional dispatch to instrumented or pass-through implementations of
+//! `CustomRwLock` and `CustomDashMap`.
 
-#[cfg(debug_assertions)]
+// Instrumented: debug builds always, or release when `diagnostics` is enabled.
+#[cfg(any(debug_assertions, feature = "diagnostics"))]
 mod debug;
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(any(debug_assertions, feature = "diagnostics")))]
 mod release;
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "diagnostics"))]
 pub use debug::*;
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(any(debug_assertions, feature = "diagnostics")))]
 pub use release::*;

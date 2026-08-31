@@ -21,10 +21,10 @@ To minimize overhead while maintaining diagnostic capabilities, the library uses
 * **Timeout scenarios**: Always capture full diagnostic information when actually needed
 * **Time-based sampling**: Ensures coverage even with low operation counts
 
-In **release** builds all of the additional bookkeeping is compiled out and the types collapse to the plain primitives:
+In **release** builds (without the `diagnostics` feature) all of the additional bookkeeping is compiled out and the types collapse to the plain primitives:
 
 ```rust
-// release mode
+// release mode (default; no `diagnostics` feature)
 pub type CustomRwLock<T> = tokio::sync::RwLock<T>;
 pub type CustomMutex<T> = tokio::sync::Mutex<T>;
 
@@ -33,6 +33,13 @@ pub struct CustomDashMap<K, V>(dashmap::DashMap<K, V>);
 
 The **release build** overhead is therefore virtually zero. In **debug builds**, the sampling-based approach keeps overhead minimal while preserving diagnostic capabilities.
 
+To keep the same instrumentation in a **release** (or other optimized) profile for local contention hunting, enable the `diagnostics` feature:
+
+```toml
+undeadlock = { version = "1.2", features = ["diagnostics"] }
+```
+
+Downstream EDAMAME crates expose this as `lock-diagnostics` (for example `cargo build --release --features lock-diagnostics` on `edamame_core`). Do not enable it for production shipping builds.
 ---
 
 ## Getting started

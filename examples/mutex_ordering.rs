@@ -271,8 +271,8 @@ fn performance_demo() {
         (iterations * 4) as f64 / read_duration.as_secs_f64()
     );
 
-    #[cfg(debug_assertions)]
-    println!("\nNote: Running in debug mode with deadlock detection enabled.");
-    #[cfg(not(debug_assertions))]
-    println!("\nNote: Running in release mode with minimal overhead.");
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    println!("\nNote: Running with deadlock detection enabled.");
+    #[cfg(not(any(debug_assertions, feature = "diagnostics")))]
+    println!("\nNote: Running with pass-through locks (minimal overhead).");
 }
