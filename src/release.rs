@@ -21,6 +21,25 @@ pub fn clear_lock_context() {}
 pub type CustomRwLock<T> = RwLock<T>;
 pub type CustomMutex<T> = Mutex<T>;
 
+/// Non-blocking access to a [`CustomMutex`] from synchronous (non-async)
+/// call sites: kernel-callback / sensor threads that must never
+/// `.lock().await` and must never block on the lock. Runs `f` under a
+/// try-lock and returns its result, or `None` when the lock is contended.
+///
+/// Normalises the return shape across the debug and release profiles: the
+/// release `CustomMutex` is a bare `tokio::sync::Mutex`, whose `try_lock`
+/// returns `Result`, so it is mapped to `Option` here to match the
+/// instrumented profile's `try_lock`.
+pub trait CustomMutexExt<T> {
+    fn try_with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R>;
+}
+
+impl<T> CustomMutexExt<T> for CustomMutex<T> {
+    fn try_with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.try_lock().ok().map(|mut guard| f(&mut guard))
+    }
+}
+
 /// Thin wrapper around `DashMap` that preserves the `CustomDashMap::new` /
 /// `new_with_timeout` constructors used throughout the codebase. Every other
 /// method call is forwarded via `Deref`/`DerefMut`.

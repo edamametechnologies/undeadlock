@@ -871,6 +871,27 @@ impl<'a, T> Drop for CustomMutexGuard<'a, T> {
     }
 }
 
+/// Non-blocking access to a [`CustomMutex`] from synchronous (non-async)
+/// call sites: kernel-callback / sensor threads that must never
+/// `.lock().await` and must never block on the lock. Runs `f` under a
+/// try-lock and returns its result, or `None` when the lock is contended.
+///
+/// This is the sanctioned way to touch a `CustomMutex` from sync code --
+/// it keeps such call sites on the instrumented wrapper (debug builds
+/// still route through `try_lock`, so lock bookkeeping is recorded)
+/// instead of dropping to a raw `std::sync::Mutex`, and it normalises the
+/// return shape across the debug and release profiles (whose underlying
+/// `try_lock` return `Option` and `Result` respectively).
+pub trait CustomMutexExt<T> {
+    fn try_with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R>;
+}
+
+impl<T> CustomMutexExt<T> for CustomMutex<T> {
+    fn try_with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.try_lock().map(|mut guard| f(&mut guard))
+    }
+}
+
 /// A wrapper around dashmap::mapref::one::RefMut that releases the write lock on drop.
 pub struct CustomRefMut<'a, K, V>
 where
